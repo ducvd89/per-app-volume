@@ -85,7 +85,9 @@ static Float64 gPendingSampleRate = 48000.0;
 static UInt32  gIORunningCount    = 0;
 static Float64 gHostTicksPerFrame = 0.0;
 static UInt64  gNumberTimeStamps  = 0;
-static UInt64  gAnchorHostTime    = 0;
+static UInt64  gAnchorHostTime    = 0;   // host time of zero timestamp number gAnchorIndex
+static UInt64  gAnchorIndex       = 0;
+static Float64 gClockTicksPerFrame = 0;  // rate the virtual clock runs at right now (follows the real device when locked)
 
 static Float32        gVolumeScalar = 1.0f;     // under gStateMutex
 static _Atomic float  gMasterGain   = 1.0f;     // linear, read on IO thread
@@ -347,6 +349,7 @@ static OSStatus PAV_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         gSampleRate = gPendingSampleRate;
         pthread_mutex_lock(&gClockMutex);
         RecomputeHostTicks();
+        gClockTicksPerFrame = gHostTicksPerFrame;
         pthread_mutex_unlock(&gClockMutex);
     }
     Float64 r = gSampleRate;
@@ -986,7 +989,9 @@ static OSStatus PAV_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID i
     pthread_mutex_lock(&gClockMutex);
     if (gIORunningCount == 0) {
         gNumberTimeStamps = 0;
+        gAnchorIndex = 0;
         gAnchorHostTime = mach_absolute_time();
+        gClockTicksPerFrame = gHostTicksPerFrame;
         atomic_store(&gWriteEnd, 0);
         atomic_fetch_add(&gStreamGen, 1);
         PAVSharedRing* ring = atomic_load_explicit(&gShm, memory_order_acquire);
@@ -1017,17 +1022,44 @@ static OSStatus PAV_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID in
     return 0;
 }
 
+/// Clock rate to use: the real output device's rate published by the app through the shared ring
+/// (so the virtual device runs exactly in step with it and nothing ever has to be resampled), or nominal.
+static Float64 CurrentTicksPerFrame(void) {
+    PAVSharedRing* ring = atomic_load_explicit(&gShm, memory_order_acquire);
+    if (ring) {
+        uint64_t bits = atomic_load_explicit(&ring->clockTicksPerFrame, memory_order_relaxed);
+        Float64 t; memcpy(&t, &bits, sizeof t);
+        // Sanity: within ±0.1% of nominal (real clocks are within ~100 ppm).
+        if (bits != 0 && t > gHostTicksPerFrame * 0.999 && t < gHostTicksPerFrame * 1.001) {
+            if (!atomic_load_explicit(&ring->clockFollowed, memory_order_relaxed))
+                atomic_store_explicit(&ring->clockFollowed, 1, memory_order_relaxed);
+            return t;
+        }
+        if (atomic_load_explicit(&ring->clockFollowed, memory_order_relaxed))
+            atomic_store_explicit(&ring->clockFollowed, 0, memory_order_relaxed);
+    }
+    return gHostTicksPerFrame;
+}
+
 static OSStatus PAV_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt32 clientID,
                                      Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
     (void)clientID;
     if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gClockMutex);
+    Float64 tpf = CurrentTicksPerFrame();
+    if (gClockTicksPerFrame <= 0) gClockTicksPerFrame = tpf;
+    if (tpf != gClockTicksPerFrame) {
+        // Rate changed: re-anchor at the current timestamp so the timeline stays continuous.
+        gAnchorHostTime += (UInt64)((Float64)(gNumberTimeStamps - gAnchorIndex) * gClockTicksPerFrame * kZeroTimeStampPeriod);
+        gAnchorIndex = gNumberTimeStamps;
+        gClockTicksPerFrame = tpf;
+    }
+    Float64 ticksPerRing = gClockTicksPerFrame * (Float64)kZeroTimeStampPeriod;
     UInt64 now = mach_absolute_time();
-    Float64 ticksPerRing = gHostTicksPerFrame * (Float64)kZeroTimeStampPeriod;
-    UInt64 next = gAnchorHostTime + (UInt64)((Float64)(gNumberTimeStamps + 1) * ticksPerRing);
+    UInt64 next = gAnchorHostTime + (UInt64)((Float64)(gNumberTimeStamps + 1 - gAnchorIndex) * ticksPerRing);
     if (next <= now) ++gNumberTimeStamps;
     *outSampleTime = (Float64)(gNumberTimeStamps * kZeroTimeStampPeriod);
-    *outHostTime   = gAnchorHostTime + (UInt64)((Float64)gNumberTimeStamps * ticksPerRing);
+    *outHostTime   = gAnchorHostTime + (UInt64)((Float64)(gNumberTimeStamps - gAnchorIndex) * ticksPerRing);
     *outSeed       = 1;
     pthread_mutex_unlock(&gClockMutex);
     return 0;

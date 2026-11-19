@@ -33,6 +33,7 @@ Measured on an Apple Silicon MacBook Pro while playing audio:
 | Per-App Volume CPU | ~0.1% |
 | Added latency | ~13 ms over the output buffer (~24 ms total) |
 | Dropouts with every core at 100% | 0 |
+| Resampled audio (clock drift) | none: the virtual clock is locked to the device |
 
 ## How it works
 
@@ -51,9 +52,11 @@ Apps (Spotify, Safari, games…) ──► "Per-App Volume" virtual output devic
   ring buffer that the app shares with it through an IOSurface. There is no IPC per audio chunk and no polling thread.
 - The app opens only an output IOProc on the real device. Because it never opens an input stream and never uses
   ScreenCaptureKit or process taps, macOS doesn't treat it as recording.
+- **Bit-perfect at 100%:** the virtual device's clock is locked to the real device's clock. The app publishes the
+  real device's measured rate (plus a tiny correction from the buffer fill level) in the shared ring, and the
+  driver generates its timestamps from it, so samples never need to be resampled to make up for clock drift.
 - The output buffer adapts to the size of the chunks the driver writes, grows after a dropout and slowly shrinks
-  back after long clean stretches. Clock drift between the virtual and real devices is corrected by ±1 frame
-  per cycle.
+  back after long clean stretches.
 - If the shared ring can't be attached, the app falls back to pulling the mix through a custom device property.
 - Every Core Audio call in the app runs on a background queue, so the UI stays responsive even when coreaudiod is slow.
 

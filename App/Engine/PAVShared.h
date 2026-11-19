@@ -23,8 +23,12 @@ typedef struct {
     _Atomic uint64_t writeEnd;     // sample time just past the newest written frame
     _Atomic uint32_t generation;   // bumped whenever the driver's IO restarts (sample time resets)
     _Atomic uint32_t attached;     // set by the driver once it writes here
-    uint8_t  _pad[64 - 32];
+    // Clock lock (added in 1.1; older builds leave these zero / ignore them):
+    _Atomic uint64_t clockTicksPerFrame;   // app → driver: host ticks per frame to run the virtual clock at (double bits)
+    _Atomic uint32_t clockFollowed;        // driver → app: 1 while the virtual clock follows clockTicksPerFrame
+    uint8_t  _pad[64 - 44];
     float    data[PAV_SHM_FRAMES * PAV_SHM_CHANNELS];   // interleaved stereo, indexed by sample time & mask
 } PAVSharedRing;
 
 #define PAV_SHM_BYTES ((uint32_t)sizeof(PAVSharedRing))
+_Static_assert(__builtin_offsetof(PAVSharedRing, data) == 64, "shared ring header must stay 64 bytes");

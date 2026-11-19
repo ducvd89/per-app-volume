@@ -65,9 +65,20 @@ static uint32_t gCyclesPerStep = 2000;
 static double   gRate = 48000.0;
 static uint64_t gLastW = 0;                // last writer position seen
 static uint32_t gChunk = 0;                // largest chunk the driver has written at once
+
+// Clock lock (shared-memory mode): instead of resampling, the virtual device's clock is steered to run exactly
+// in step with the real device. Feed-forward: the real device's measured rate (HAL rate scalar). Feedback: a
+// gentle correction from the average buffer fill, so the fill level stays where priming put it.
+static double   gNominalTicksPerFrame = 0;
+static double   gFillAvg = 0;               // smoothed frames available before consuming
+static double   gFillSetpoint = 0;          // fill level to hold (learned right after priming)
+static uint32_t gLockCycles = 0;            // cycles since priming
+static double   gPendingRaise = 0;          // target increases before the setpoint was learned
+static _Atomic int32_t gClockPPMx10 = 0;    // last correction applied, for stats
 static uint32_t gBufFrames = 512;
 
 static _Atomic uint32_t gUnderruns = 0;
+static _Atomic uint32_t gAdjusts = 0;      // cycles that had to be resampled by ±1 frame (clock drift)
 static _Atomic uint64_t gReadPos = 0;       // mirror of gR for stats
 static _Atomic uint32_t gTargetPub = 0;
 
@@ -204,7 +215,10 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
                 uint32_t floor = c + (uint32_t)(gRate * 0.003);
                 if (floor > gTargetMax) floor = gTargetMax;
                 if (gTargetMin < floor) gTargetMin = floor;
-                if (gTarget < floor) gTarget = floor;
+                if (gTarget < floor) {
+                    if (gLockCycles > 300) gFillSetpoint += floor - gTarget; else gPendingRaise += floor - gTarget;
+                    gTarget = floor;
+                }
             }
         }
         gLastW = w;
@@ -215,6 +229,7 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
         if (w < (uint64_t)gTarget + frames) return noErr;
         r = w - gTarget - frames;
         gPrimed = true;
+        gLockCycles = 0; gPendingRaise = 0;
     }
     if (r > w) { gPrimed = false; gR = w; return noErr; }   // writer restarted
     uint64_t avail = w - r;
@@ -222,8 +237,33 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
     // Big backlog (stall / device change): jump forward.
     if (avail > (uint64_t)gTarget * 2 + frames + gChunk) { r = w - gTarget - frames; avail = gTarget + frames; }
 
-    // Clock drift between the virtual device and the real one: consume ±1 frame.
-    uint32_t tol = gTarget / 6 + 32;
+    if (gShm) {
+        // Feed-forward: the real device's actual host ticks per frame.
+        double rs = (now && (now->mFlags & kAudioTimeStampRateScalarValid) && now->mRateScalar > 0.99 && now->mRateScalar < 1.01)
+                    ? now->mRateScalar : 1.0;
+        double tpf = gNominalTicksPerFrame * rs;
+        // Feedback: hold the average fill level. Too much buffered → slow the virtual clock down, and vice versa.
+        if (gLockCycles == 0) gFillAvg = (double)avail;
+        gFillAvg += 0.01 * ((double)avail - gFillAvg);
+        if (++gLockCycles == 300) gFillSetpoint = gFillAvg + gPendingRaise;   // ~3 s after priming
+        double ppm = 0;
+        if (gLockCycles > 300) {
+            // 1 ppm per frame of error: drift-level errors are trimmed in ~20 s; big level changes (e.g. the target
+            // grew) are absorbed at up to 800 ppm (~38 frames/s) — the apps simply run a hair faster or slower,
+            // every sample stays intact.
+            ppm = 1.0 * (gFillAvg - gFillSetpoint);
+            if (ppm > 800) ppm = 800; else if (ppm < -800) ppm = -800;
+        }
+        tpf *= 1.0 + ppm * 1e-6;
+        uint64_t bits; memcpy(&bits, &tpf, sizeof bits);
+        atomic_store_explicit(&gShm->clockTicksPerFrame, bits, memory_order_relaxed);
+        atomic_store_explicit(&gClockPPMx10, (int32_t)lround(ppm * 10), memory_order_relaxed);
+    }
+
+    // Clock drift between the virtual device and the real one: consume ±1 frame. With the clock lock active this
+    // is only an emergency net (wide dead band); without it (polling / older driver) it's the regular mechanism.
+    bool locked = gShm && atomic_load_explicit(&gShm->clockFollowed, memory_order_relaxed);
+    uint32_t tol = locked ? gTarget + 512 : gTarget / 6 + 32;   // locked: emergency only
     uint32_t consume = frames;
     if (avail > (uint64_t)gTarget + frames + tol) consume = frames + 1;
     else if (avail + tol < (uint64_t)gTarget + frames && frames > 1) consume = frames - 1;
@@ -261,13 +301,14 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
         }
     }
     gR = r + consume;
+    if (consume != frames) atomic_fetch_add_explicit(&gAdjusts, 1, memory_order_relaxed);
 
     // Adapt latency: after a long clean stretch, shave 1 ms if we always had spare frames.
     uint32_t slack = (uint32_t)(avail - consume);
     if (slack < gMinSlack) gMinSlack = slack;
     if (++gCyclesClean >= gCyclesPerStep) {
         uint32_t ms1 = (uint32_t)(gRate * 0.001);
-        if (gMinSlack > ms1 * 3 && gTarget > gTargetMin + ms1) gTarget -= ms1;
+        if (gMinSlack > ms1 * 3 && gTarget > gTargetMin + ms1) { gTarget -= ms1; gFillSetpoint -= ms1; }
         gCyclesClean = 0; gMinSlack = UINT32_MAX;
     }
     atomic_store_explicit(&gTargetPub, gTarget, memory_order_relaxed);
@@ -313,13 +354,15 @@ static void ComputeChannelMap(AudioObjectID dev) {
 static void StartStats(void) {
     gStatsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     dispatch_source_set_timer(gStatsTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), 10 * NSEC_PER_SEC, NSEC_PER_SEC);
-    __block uint32_t last = 0;
+    __block uint32_t last = 0, lastAdj = 0;
     dispatch_source_set_event_handler(gStatsTimer, ^{
-        uint32_t u = atomic_load(&gUnderruns);
-        os_log(gLog, "engine %{public}s: underruns +%u, latency target %.1f ms, buffered %.1f ms",
-               gShm ? "shared-memory" : "polling", u - last,
+        uint32_t u = atomic_load(&gUnderruns), adj = atomic_load(&gAdjusts);
+        bool lk = gShm && atomic_load(&gShm->clockFollowed);
+        os_log(gLog, "engine %{public}s%{public}s: underruns +%u, resampled cycles +%u, clock trim %.1f ppm, latency target %.1f ms, buffered %.1f ms",
+               gShm ? "shared-memory" : "polling", lk ? " +clock lock" : "", u - last, adj - lastAdj,
+               atomic_load(&gClockPPMx10) / 10.0,
                (atomic_load(&gTargetPub) + gBufFrames) * 1000.0 / gRate, PAVEngineBufferedMs());
-        last = u;
+        last = u; lastAdj = adj;
     });
     dispatch_resume(gStatsTimer);
 }
@@ -341,6 +384,8 @@ OSStatus PAVEngineStart(AudioObjectID virtualDevice, AudioObjectID outputDevice)
     if (bufFrames < 64) bufFrames = 64;
     if (bufFrames > 4096) bufFrames = 4096;
     gBufFrames = bufFrames;
+    { mach_timebase_info_data_t tb; mach_timebase_info(&tb); gNominalTicksPerFrame = 1e9 * tb.denom / tb.numer / gRate; }
+    gLockCycles = 0; gFillSetpoint = 0;
     gCyclesPerStep = (uint32_t)(20.0 * gRate / bufFrames);   // ~20 s between shrink steps
 
     ComputeChannelMap(outputDevice);
@@ -387,6 +432,7 @@ OSStatus PAVEngineStart(AudioObjectID virtualDevice, AudioObjectID outputDevice)
 
 void PAVEngineStop(void) {
     if (gStatsTimer) { dispatch_source_cancel(gStatsTimer); gStatsTimer = NULL; }
+    if (gShmMem) atomic_store(&gShmMem->clockTicksPerFrame, 0);   // driver falls back to its nominal clock
     if (gProcID) {
         AudioDeviceStop(gOut, gProcID);
         AudioDeviceDestroyIOProcID(gOut, gProcID);
