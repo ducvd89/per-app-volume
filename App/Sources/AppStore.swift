@@ -33,9 +33,8 @@ final class AppStore: ObservableObject {
     let router: Router
     private var timer: Timer?
     private let ownPID = getpid()
-    /// When each app last produced sound (main thread). Apps stay listed for a while after they go quiet.
-    private var lastPlayed: [String: Date] = [:]
-    private static let recentWindow: TimeInterval = 15
+    /// Apps that have ever produced sound (persisted). The list shows these while they're running.
+    private var everPlayed: Set<String>
     var fastRefresh = false { didSet { scheduleTimer() } }
 
     // audioQueue-only
@@ -53,6 +52,9 @@ final class AppStore: ObservableObject {
         muted = Set(d.stringArray(forKey: "appMuted") ?? [])
         pinned = Set(d.stringArray(forKey: "appPinned") ?? [])
         hidden = Set(d.stringArray(forKey: "appHidden") ?? [])
+        // Apps whose volume was ever adjusted have obviously played before.
+        let vols = (d.dictionary(forKey: "appVolumes") as? [String: Double]) ?? [:]
+        everPlayed = Set(d.stringArray(forKey: "appEverPlayed") ?? []).union(vols.keys).union(d.stringArray(forKey: "appMuted") ?? [])
         scheduleTimer()
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification,
                                                           object: nil, queue: .main) { [weak self] n in
@@ -74,18 +76,24 @@ final class AppStore: ObservableObject {
     func isPinned(_ key: String) -> Bool { pinned.contains(key) }
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
 
-    /// Apps worth showing: user apps that are playing (or played in the last few seconds), games,
-    /// and anything pinned. Background/system processes are never listed (their saved volume still applies).
-    private func isRelevant(_ a: AudioApp) -> Bool {
-        if pinned.contains(a.key) { return true }
-        guard a.isUserApp else { return false }
-        if a.isGame || a.playing { return true }
-        if let t = lastPlayed[a.key], Date().timeIntervalSince(t) < Self.recentWindow { return true }
-        return false
+    /// The list: running apps (with windows) that have ever played audio, plus pinned apps.
+    /// Background/system processes are never listed (their saved volume still applies).
+    private var listed: [AudioApp] {
+        var out = apps.filter { pinned.contains($0.key) || ($0.isUserApp && everPlayed.contains($0.key)) }
+        // Apps that played before but have closed their audio connection for now (e.g. a paused browser tab).
+        var seen = Set(out.map(\.key))
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard let key = app.bundleIdentifier ?? app.bundleURL?.path, !seen.contains(key),
+                  everPlayed.contains(key) || pinned.contains(key), app.processIdentifier != ownPID else { continue }
+            seen.insert(key)
+            out.append(AudioApp(key: key, name: app.localizedName ?? key, icon: app.icon ?? NSImage(), pids: [],
+                                playing: false, peak: 0, isUserApp: true, isGame: false))
+        }
+        return out
     }
 
     var visibleApps: [AudioApp] {
-        apps.filter { isRelevant($0) && (showHidden || !hidden.contains($0.key)) }
+        listed.filter { showHidden || !hidden.contains($0.key) }
             .sorted { a, b in
                 let pa = pinned.contains(a.key), pb = pinned.contains(b.key)
                 if pa != pb { return pa }
@@ -93,7 +101,7 @@ final class AppStore: ObservableObject {
                 return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
             }
     }
-    var hiddenCount: Int { apps.filter { isRelevant($0) && hidden.contains($0.key) }.count }
+    var hiddenCount: Int { listed.filter { hidden.contains($0.key) }.count }
 
     // MARK: Mutations
 
@@ -162,19 +170,19 @@ final class AppStore: ObservableObject {
     private func apply(_ fresh: [AudioApp]) {
         // Smooth meters (fall-off) so they don't flicker between polls.
         let old = Dictionary(apps.map { ($0.key, $0.peak) }, uniquingKeysWith: { a, _ in a })
-        let now = Date()
+        var newlyPlayed = false
         let newApps = fresh.map { a -> AudioApp in
             var a = a
             a.peak = max(a.peak, (old[a.key] ?? 0) * 0.7)
             if a.peak < 0.001 { a.peak = 0 }
             // "Playing" means actually making sound: many apps (Discord, browsers) keep the device open while silent.
             a.playing = a.playing && a.peak > 0
-            if a.playing { lastPlayed[a.key] = now }
+            if a.playing, a.isUserApp, !everPlayed.contains(a.key) { everPlayed.insert(a.key); newlyPlayed = true }
             return a
         }.sorted { $0.key < $1.key }
-        lastPlayed = lastPlayed.filter { now.timeIntervalSince($0.value) < Self.recentWindow * 4 }
-        if newApps != apps { apps = newApps } else { objectWillChange.send() }   // "recently played" window expires over time
-        selection.formIntersection(Set(apps.map(\.key)))
+        if newlyPlayed { UserDefaults.standard.set(Array(everPlayed), forKey: "appEverPlayed") }
+        if newApps != apps { apps = newApps } else { objectWillChange.send() }   // running apps change over time
+        selection.formIntersection(Set(visibleApps.map(\.key)))
         push()
     }
 

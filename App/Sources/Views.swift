@@ -61,7 +61,7 @@ struct PopoverView: View {
             VStack(spacing: 6) {
                 Image(systemName: "speaker.zzz").font(.system(size: 22)).foregroundStyle(.tertiary)
                 Text("No apps are playing audio").font(.system(size: 12)).foregroundStyle(.secondary)
-                Text("Apps appear here while they play · pin one to keep it here").font(.system(size: 10)).foregroundStyle(.tertiary)
+                Text("Running apps show up here once they play audio").font(.system(size: 10)).foregroundStyle(.tertiary)
             }
             .frame(maxWidth: .infinity).padding(.vertical, 28)
         } else {

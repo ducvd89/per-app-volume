@@ -10,7 +10,7 @@ shows no orange or purple privacy indicator and asks for no permissions.
 - **Per-app volume** from 0 to 200% (above 100% is a boost), plus mute for each app
 - **Remembers volumes** per app (by bundle ID) and re-applies them when the app comes back
 - **Groups helper processes** under their app (Chrome Helper → Chrome, WebKit → Safari, game launchers → game)
-- **Clean list:** shows only apps with windows that are playing (or played in the last 15 s), games, and pinned apps;
+- **Clean list:** shows the running apps (with windows) that have ever played audio, plus pinned apps;
   system services are never listed
 - **Pin, hide and multi-select** (⌘-click) to mute, pin, hide or set the volume of several apps at once
 - **Level meter** for each app
