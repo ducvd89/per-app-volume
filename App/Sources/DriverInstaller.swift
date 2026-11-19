@@ -56,11 +56,12 @@ final class DriverInstaller: ObservableObject {
         run(cmd, success: "Driver removed.")
     }
 
+    // `launchctl kickstart` is refused for coreaudiod (and AirPlayXPCHelper) while SIP is on, so just kill
+    // coreaudiod; launchd restarts it right away and it loads the new driver.
+    // Note: macOS' AirPlayXPCHelper re-registers its drivers twice as often on every coreaudiod restart and
+    // can't be reset without a reboot, so avoid needless reinstalls (a reboot clears it).
     private var restartCoreAudio: String {
-        // AirPlayXPCHelper re-registers its drivers twice as often on every coreaudiod restart (macOS bug);
-        // restarting it first keeps coreaudiod from ending up with thousands of copies and pegging the CPU.
-        "/bin/launchctl kickstart -k system/com.apple.AirPlayXPCHelper 2>/dev/null; /bin/sleep 1; " +
-        "/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || /usr/bin/killall coreaudiod 2>/dev/null; exit 0"
+        "/usr/bin/killall coreaudiod 2>/dev/null; exit 0"
     }
 
     /// Single-quote for the shell.
