@@ -175,8 +175,9 @@ final class AppStore: ObservableObject {
             var a = a
             a.peak = max(a.peak, (old[a.key] ?? 0) * 0.7)
             if a.peak < 0.001 { a.peak = 0 }
-            // "Playing" means actually making sound: many apps (Discord, browsers) keep the device open while silent.
-            a.playing = a.playing && a.peak > 0
+            // "Playing" means actually making sound. The level is the reliable signal: many apps keep the device
+            // open while silent, and some (e.g. NTE) produce sound while the driver's IO-running flag reads false.
+            a.playing = a.peak > 0
             if a.playing, a.isUserApp, !everPlayed.contains(a.key) { everPlayed.insert(a.key); newlyPlayed = true }
             return a
         }.sorted { $0.key < $1.key }
