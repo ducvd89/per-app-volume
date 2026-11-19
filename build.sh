@@ -42,8 +42,15 @@ codesign --force --deep --sign - "$APP"
 
 echo "==> Package"
 mkdir -p dist
-rm -rf "dist/Per-App Volume.app" "dist/Per-App-Volume.zip"
+rm -rf "dist/Per-App Volume.app" "dist/Per-App-Volume.zip" "dist/Per-App-Volume.dmg"
 cp -R "$APP" "dist/Per-App Volume.app"
 (cd dist && ditto -c -k --keepParent "Per-App Volume.app" "Per-App-Volume.zip")
 
-echo "==> Done: dist/Per-App Volume.app  (zip: dist/Per-App-Volume.zip)"
+# Drag-to-install disk image: the app plus a link to /Applications.
+STAGE="$BUILD/dmg"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/Per-App Volume.app"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -quiet -volname "Per-App Volume" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "dist/Per-App-Volume.dmg"
+
+echo "==> Done: dist/Per-App Volume.app, dist/Per-App-Volume.zip, dist/Per-App-Volume.dmg"
