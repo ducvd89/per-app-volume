@@ -1,0 +1,419 @@
+import CoreAudio
+import Foundation
+import os
+
+private let volLog = Logger(subsystem: "com.perappvolume.app", category: "volume")
+
+/// Every Core Audio call goes through this serial queue. coreaudiod can stall (driver install,
+/// macOS bugs); when it does, only this queue waits — the menu bar UI stays responsive.
+let audioQueue = DispatchQueue(label: "com.perappvolume.audio", qos: .userInitiated)
+
+enum OutputMode: String, CaseIterable, Identifiable {
+    case followSystem   // follow macOS default output (manual picks / newly connected devices)
+    case customOrder    // always use the first available device in the user's priority list
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .followSystem: return "Follow macOS output device"
+        case .customOrder:  return "Use custom priority order"
+        }
+    }
+}
+
+/// Keeps the virtual "Per-App Volume" device as the system default output and
+/// forwards its mix to the real device the user wants to hear.
+///
+/// Threading: the `@Published` properties are main-thread snapshots for the UI. The routing logic
+/// and its state (`q…` members) live on `audioQueue`. UI actions are forwarded there asynchronously.
+final class Router: ObservableObject {
+    enum State: Equatable { case driverMissing, idle, running, error(String) }
+
+    // MARK: UI snapshot (main thread)
+    @Published private(set) var state: State = .idle
+    @Published private(set) var devices: [AudioDevice] = []
+    @Published private(set) var target: AudioDevice?
+    @Published var mode: OutputMode {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "outputMode")
+            let m = mode
+            audioQueue.async { self.qMode = m; self.reevaluate(reason: .modeChanged) }
+        }
+    }
+    /// Most recently chosen first (follow mode), or user-defined order (custom mode).
+    @Published private(set) var priority: [String]
+    @Published private(set) var deviceNames: [String: String]
+    @Published private(set) var masterVolume: Float = 1
+    @Published private(set) var masterMuted = false
+
+    var realDevices: [AudioDevice] { devices.filter { !$0.isVirtualRouter } }
+
+    // MARK: Logic state (audioQueue only)
+    private var qMode: OutputMode
+    private var qPriority: [String]
+    private var qDeviceNames: [String: String]
+    private var qDevices: [AudioDevice] = []
+    private var qTarget: AudioDevice?
+    private var qVirtual: AudioObjectID?
+    private var qRealDevices: [AudioDevice] { qDevices.filter { !$0.isVirtualRouter } }
+    private var lastDeviceListChange = Date.distantPast
+    private var listeners: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope, AudioObjectPropertyListenerBlock)] = []
+    private var rateListener: (AudioObjectID, AudioObjectPropertyListenerBlock)?
+    private var stopWork: DispatchWorkItem?
+    private var napBlocker: NSObjectProtocol?
+    /// Real output devices seen so far (nil until the first scan), to detect newly plugged-in ones.
+    private var knownUIDs: Set<String>?
+
+    init() {
+        let d = UserDefaults.standard
+        let m = OutputMode(rawValue: d.string(forKey: "outputMode") ?? "") ?? .followSystem
+        let p = d.stringArray(forKey: "devicePriority") ?? []
+        let n = (d.dictionary(forKey: "deviceNames") as? [String: String]) ?? [:]
+        mode = m; priority = p; deviceNames = n
+        qMode = m; qPriority = p; qDeviceNames = n
+    }
+
+    /// The virtual device's id. Only valid on `audioQueue`.
+    var virtualID: AudioObjectID? {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        return qVirtual
+    }
+
+    // MARK: Public API (call from main)
+
+    func start() {
+        audioQueue.async {
+            let sys = AudioObjectID(kAudioObjectSystemObject)
+            self.addListener(sys, kAudioHardwarePropertyDevices) { [weak self] in
+                self?.lastDeviceListChange = Date()
+                self?.reevaluate(reason: .devicesChanged)
+            }
+            self.addListener(sys, kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
+                self?.reevaluate(reason: .defaultChanged)
+            }
+            self.reevaluate(reason: .launch)
+        }
+    }
+
+    /// Restore the real device as macOS default (called on quit). Waits at most `timeout` for coreaudiod.
+    func shutdown(timeout: TimeInterval = 2) {
+        let done = DispatchSemaphore(value: 0)
+        audioQueue.async {
+            PAVEngineStop()
+            for (obj, sel, scope, l) in self.listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
+            self.listeners.removeAll()
+            if let (dev, l) = self.rateListener { CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l) }
+            if let v = self.qVirtual, let t = self.qTarget, CA.device(uid: t.uid) != nil {
+                self.handBackVolume(to: t)
+                if CA.defaultOutput == v { CA.setDefaultOutput(t.id) }
+                if CA.defaultSystemOutput == v { CA.setDefaultSystemOutput(t.id) }
+            }
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + timeout)
+    }
+
+    /// Re-scan devices (e.g. after the driver was installed and coreaudiod restarted).
+    func rescan() { audioQueue.async { self.reevaluate(reason: .devicesChanged) } }
+
+    /// Stop forwarding and make the real device the macOS default again (before uninstalling the driver).
+    func releaseOutput(timeout: TimeInterval = 3) {
+        let done = DispatchSemaphore(value: 0)
+        audioQueue.async {
+            PAVEngineStop()
+            if let t = self.qTarget, CA.device(uid: t.uid) != nil {
+                self.handBackVolume(to: t)
+                CA.setDefaultOutput(t.id)
+                CA.setDefaultSystemOutput(t.id)
+            }
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + timeout)
+    }
+
+    func choose(_ device: AudioDevice) {
+        target = device   // optimistic, so the menu checkmark moves immediately
+        audioQueue.async {
+            self.promote(device.uid)
+            self.applyTarget(device)
+            self.publishPriority()
+        }
+    }
+
+    func movePriority(from: Int, to: Int) {
+        audioQueue.async {
+            guard self.qPriority.indices.contains(from), to >= 0, to < self.qPriority.count else { return }
+            let item = self.qPriority.remove(at: from)
+            self.qPriority.insert(item, at: to)
+            self.publishPriority()
+            self.reevaluate(reason: .modeChanged)
+        }
+    }
+
+    func removePriority(at index: Int) {
+        audioQueue.async {
+            guard self.qPriority.indices.contains(index) else { return }
+            self.qPriority.remove(at: index)
+            self.publishPriority()
+        }
+    }
+
+    func setMasterVolume(_ v: Float) {
+        let v = max(0, min(1, v))
+        masterVolume = v
+        audioQueue.async {
+            guard let virt = self.qVirtual else { return }
+            CA.set(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, Float32(v))
+        }
+    }
+
+    func setMasterMuted(_ m: Bool) {
+        masterMuted = m
+        audioQueue.async {
+            guard let virt = self.qVirtual else { return }
+            CA.set(virt, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, UInt32(m ? 1 : 0))
+        }
+    }
+
+    // MARK: Publishing snapshots to the UI
+
+    private func onMain(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
+
+    private func publishState(_ s: State) { onMain { if self.state != s { self.state = s } } }
+
+    private func publishPriority() {
+        let p = qPriority
+        UserDefaults.standard.set(p, forKey: "devicePriority")
+        onMain { if self.priority != p { self.priority = p } }
+    }
+
+    private func publishDevices() {
+        let d = qDevices, t = qTarget, n = qDeviceNames
+        UserDefaults.standard.set(n, forKey: "deviceNames")
+        onMain {
+            if self.devices != d { self.devices = d }
+            if self.target != t { self.target = t }
+            if self.deviceNames != n { self.deviceNames = n }
+        }
+    }
+
+    // MARK: Logic (audioQueue)
+
+    private enum Reason { case launch, devicesChanged, defaultChanged, modeChanged }
+
+    private func addListener(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector,
+                             scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, _ block: @escaping () -> Void) {
+        let l = CA.listen(obj, sel, scope: scope, queue: audioQueue, block)
+        listeners.append((obj, sel, scope, l))
+    }
+
+    private func setPlaying(_ on: Bool) {
+        if on, napBlocker == nil {
+            // Keeps App Nap from throttling us while audio plays.
+            napBlocker = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "Forwarding audio")
+        } else if !on, let b = napBlocker {
+            ProcessInfo.processInfo.endActivity(b); napBlocker = nil
+        }
+    }
+
+    private func promote(_ uid: String) {
+        if qMode == .followSystem {
+            qPriority.removeAll { $0 == uid }
+            qPriority.insert(uid, at: 0)
+        } else if !qPriority.contains(uid) {
+            qPriority.append(uid)
+        }
+    }
+
+    private func reevaluate(reason: Reason) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        defer { publishDevices(); publishPriority() }
+        qDevices = CA.allOutputDevices()
+        let historyBefore = qPriority   // MRU history before newly seen devices get appended
+        for d in qRealDevices where qDeviceNames[d.uid] != d.name { qDeviceNames[d.uid] = d.name }
+        for d in qRealDevices where !qPriority.contains(d.uid) { qPriority.append(d.uid) }
+
+        guard let virt = qDevices.first(where: { $0.isVirtualRouter }) else {
+            // Virtual device gone (driver reinstall / coreaudiod restart): give the real device its level back
+            // right away, otherwise it would play at the full volume we set while forwarding.
+            if qVirtual != nil, let t = qTarget { handBackVolume(to: t); volumeHandedBack = true }
+            qVirtual = nil
+            PAVEngineStop(); setPlaying(false)
+            publishState(.driverMissing)
+            let def = CA.defaultOutput
+            qTarget = qRealDevices.first { $0.id == def }
+            return
+        }
+        let virtChanged = qVirtual != virt.id
+        qVirtual = virt.id
+        if virtChanged { watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); refreshCachedMaster() }
+
+        // A device appeared (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
+        // macOS won't switch by itself, so apply its rules here (see DeviceSwitching).
+        let currentUIDs = Set(qRealDevices.map(\.uid))
+        defer { knownUIDs = currentUIDs }
+        if qMode == .followSystem, reason == .devicesChanged, let known = knownUIDs {
+            let appeared = qRealDevices
+                .filter { !known.contains($0.uid) && DeviceSwitching.canTakeOverOnConnect(transport: $0.transport) }
+                .map(\.uid)
+            let current = qTarget.flatMap { currentUIDs.contains($0.uid) ? $0.uid : nil }
+            if let uid = DeviceSwitching.deviceToSwitchTo(appeared: appeared, history: historyBefore, current: current),
+               let dev = qRealDevices.first(where: { $0.uid == uid }) {
+                promote(uid)
+                applyTarget(dev)
+                return
+            }
+        }
+
+        let def = CA.defaultOutput
+        if def != virt.id, let picked = qRealDevices.first(where: { $0.id == def }) {
+            // The user (or macOS, e.g. headphones connected) selected a real device.
+            // In custom-order mode, ignore macOS' automatic switch on connect and fall through to the priority list.
+            let autoSwitch = Date().timeIntervalSince(lastDeviceListChange) < 1.5
+            if qMode == .followSystem || (!autoSwitch && reason != .launch) {
+                promote(picked.uid)
+                applyTarget(picked)
+                return
+            }
+        }
+
+        // Pick by priority.
+        let available = Dictionary(qRealDevices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
+        var next: AudioDevice?
+        if qMode == .customOrder || qTarget == nil || available[qTarget!.uid] == nil {
+            // Current output gone (or custom order): most recently used / highest priority device still connected.
+            next = DeviceSwitching.fallback(history: qPriority, connected: qRealDevices.map(\.uid)).flatMap { available[$0] }
+        } else {
+            next = available[qTarget!.uid]
+        }
+        if let n = next { applyTarget(n) } else {
+            PAVEngineStop(); setPlaying(false)
+            qTarget = nil
+            publishState(.error("No output device available"))
+        }
+    }
+
+    private func applyTarget(_ device: AudioDevice) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard let virt = qVirtual else { return }
+        let changed = qTarget?.id != device.id
+        if changed, let old = qTarget, !volumeHandedBack { handBackVolume(to: old) }
+        qTarget = device
+        if changed || volumeHandedBack { takeOverVolume(from: device); volumeHandedBack = false }
+        publishDevices()
+
+        // Match sample rates so nothing has to be resampled.
+        syncRate()
+        if let (dev, l) = rateListener, dev != device.id || changed {
+            CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l)
+            rateListener = nil
+        }
+        if rateListener == nil {
+            let l = CA.listen(device.id, kAudioDevicePropertyNominalSampleRate, queue: audioQueue) { [weak self] in
+                self?.syncRate()
+                self?.restartEngineIfNeeded(force: true)
+            }
+            rateListener = (device.id, l)
+        }
+
+        if CA.defaultOutput != virt { CA.setDefaultOutput(virt) }
+        if CA.defaultSystemOutput != virt { CA.setDefaultSystemOutput(virt) }
+        restartEngineIfNeeded(force: changed || !PAVEngineIsRunning())
+    }
+
+    private func syncRate() {
+        guard let virt = qVirtual, let t = qTarget else { return }
+        let r = CA.sampleRate(t.id)
+        let supported: [Double] = [44100, 48000, 88200, 96000, 176400, 192000]
+        guard r > 0 else { return }
+        let best = supported.min { abs($0 - r) < abs($1 - r) } ?? 48000
+        if abs(CA.sampleRate(virt) - best) > 0.5 { CA.set(virt, kAudioDevicePropertyNominalSampleRate, Float64(best)) }
+    }
+
+    private func watchVirtualVolume(_ virt: AudioObjectID) {
+        for sel in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            addListener(virt, sel, scope: kAudioObjectPropertyScopeOutput) { [weak self] in self?.refreshCachedMaster() }
+        }
+    }
+
+    // Only keep the real device running while something actually plays, so the Mac can sleep.
+    private func watchVirtualRunning(_ virt: AudioObjectID) {
+        addListener(virt, kAudioDevicePropertyDeviceIsRunningSomewhere) { [weak self] in
+            self?.restartEngineIfNeeded(force: false)
+        }
+    }
+
+    private func virtualIsRunning() -> Bool {
+        guard let v = qVirtual else { return false }
+        return (CA.get(v, kAudioDevicePropertyDeviceIsRunningSomewhere, default: UInt32(0)) ?? 0) != 0
+    }
+
+    private func restartEngineIfNeeded(force: Bool) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard let virt = qVirtual, let t = qTarget else { return }
+        if virtualIsRunning() {
+            stopWork?.cancel(); stopWork = nil
+            if force || !PAVEngineIsRunning() {
+                let st = PAVEngineStart(virt, t.id)
+                publishState(st == noErr ? .running : .error("Couldn't open \(t.name) (\(st))"))
+                setPlaying(st == noErr)
+            }
+        } else if PAVEngineIsRunning() {
+            if force { PAVEngineStop(); setPlaying(false); publishState(.idle); return }
+            guard stopWork == nil else { return }
+            let w = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.stopWork = nil
+                if !self.virtualIsRunning() { PAVEngineStop(); self.setPlaying(false); self.publishState(.idle) }
+            }
+            stopWork = w
+            audioQueue.asyncAfter(deadline: .now() + 3, execute: w)
+        } else {
+            publishState(.idle)
+        }
+    }
+
+    // MARK: Volume hand-off
+    // The real device runs at full volume while we forward to it; its previous level becomes the
+    // virtual master volume (what the keyboard keys control), so loudness doesn't jump and 100% in
+    // Per-App Volume means the device's real maximum. On quit / switch, the level is handed back.
+
+    private var volumeHandedBack = false
+    /// Last known master level, also used when the virtual device has already disappeared.
+    private var cachedMaster: (volume: Float, muted: Bool) = (1, false)
+
+    private func refreshCachedMaster() {
+        guard let v = qVirtual else { return }
+        let vol = CA.get(v, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, default: Float32(1)) ?? 1
+        let mute = (CA.get(v, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, default: UInt32(0)) ?? 0) != 0
+        cachedMaster = (vol, mute)
+        onMain {
+            if abs(self.masterVolume - vol) > 0.001 { self.masterVolume = vol }
+            if self.masterMuted != mute { self.masterMuted = mute }
+        }
+    }
+
+    private func takeOverVolume(from device: AudioDevice) {
+        guard let virt = qVirtual, let hw = CA.hardwareVolume(device.id) else {
+            volLog.log("takeOver \(device.name, privacy: .public): no hardware volume")
+            return
+        }
+        volLog.log("takeOver \(device.name, privacy: .public) hw=\(hw)")
+        if hw < 0.999 {
+            CA.set(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, Float32(hw))
+            CA.setHardwareVolume(device.id, 1)
+        }
+        if CA.hardwareMute(device.id) == true {
+            CA.set(virt, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, UInt32(1))
+            CA.setHardwareMute(device.id, false)
+        }
+        refreshCachedMaster()
+    }
+
+    private func handBackVolume(to device: AudioDevice) {
+        guard let id = CA.device(uid: device.uid), CA.hardwareVolume(id) != nil else { return }
+        refreshCachedMaster()
+        volLog.log("handBack \(device.name, privacy: .public) -> \(self.cachedMaster.volume)")
+        CA.setHardwareVolume(id, cachedMaster.volume)
+        if cachedMaster.muted { CA.setHardwareMute(id, true) }
+    }
+}
