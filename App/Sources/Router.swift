@@ -45,6 +45,16 @@ final class Router: ObservableObject {
     @Published private(set) var masterVolume: Float = 1
     @Published private(set) var masterMuted = false
 
+    // Call mode: while a calling app uses the mic, the macOS default output is the real device itself, so
+    // voice processing (echo cancellation) works. Per-app volumes don't apply to the call meanwhile.
+    @Published var callModeEnabled: Bool { didSet { saveCallConfig() } }
+    @Published var callAppsOnly: Bool { didSet { saveCallConfig() } }
+    @Published var callApps: [String] { didSet { saveCallConfig() } }
+    /// Calling apps using the mic right now (nil: no call).
+    @Published private(set) var callUsers: [String]?
+    /// The default output is currently the real device because of a call.
+    @Published private(set) var inCall = false
+
     var realDevices: [AudioDevice] { devices.filter { !$0.isVirtualRouter } }
 
     // MARK: Logic state (audioQueue only)
@@ -63,6 +73,17 @@ final class Router: ObservableObject {
     /// Real output devices seen so far (nil until the first scan), to detect newly plugged-in ones.
     private var knownUIDs: Set<String>?
 
+    private enum CallState: Equatable {
+        case none
+        case routing(AudioObjectID)   // we made this real device the default output (0 = not set yet)
+        case overridden               // the user changed the default output during the call; leave it alone
+    }
+    private var qCallState: CallState = .none
+    private var callEndWork: DispatchWorkItem?
+    private var mic: MicMonitor!
+    /// How long the mic must stay off before the virtual device becomes the default again.
+    private let callEndDelay: TimeInterval = 4
+
     init() {
         let d = UserDefaults.standard
         let m = OutputMode(rawValue: d.string(forKey: "outputMode") ?? "") ?? .followSystem
@@ -70,6 +91,22 @@ final class Router: ObservableObject {
         let n = (d.dictionary(forKey: "deviceNames") as? [String: String]) ?? [:]
         mode = m; priority = p; deviceNames = n
         qMode = m; qPriority = p; qDeviceNames = n
+        let ce = d.object(forKey: "callModeEnabled") as? Bool ?? true
+        let co = d.object(forKey: "callAppsOnly") as? Bool ?? true
+        let ca = d.stringArray(forKey: "callApps") ?? kDefaultCallApps
+        callModeEnabled = ce; callAppsOnly = co; callApps = ca
+        mic = MicMonitor(config: .init(enabled: ce, onlyListed: co, apps: ca))
+        mic.onChange = { [weak self] users in self?.micChanged(users) }
+        mic.isOurOutput = { [weak self] id in self?.qTarget?.id == id && PAVEngineIsRunning() }
+    }
+
+    private func saveCallConfig() {
+        let d = UserDefaults.standard
+        d.set(callModeEnabled, forKey: "callModeEnabled")
+        d.set(callAppsOnly, forKey: "callAppsOnly")
+        d.set(callApps, forKey: "callApps")
+        let c = MicMonitor.Config(enabled: callModeEnabled, onlyListed: callAppsOnly, apps: callApps)
+        audioQueue.async { self.mic.update(c) }
     }
 
     /// The virtual device's id. Only valid on `audioQueue`.
@@ -91,6 +128,7 @@ final class Router: ObservableObject {
                 self?.reevaluate(reason: .defaultChanged)
             }
             self.reevaluate(reason: .launch)
+            self.mic.start()
         }
     }
 
@@ -99,11 +137,13 @@ final class Router: ObservableObject {
         let done = DispatchSemaphore(value: 0)
         audioQueue.async {
             PAVEngineStop()
+            self.mic.stop()
+            self.callEndWork?.cancel()
             for (obj, sel, scope, l) in self.listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
             self.listeners.removeAll()
             if let (dev, l) = self.rateListener { CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l) }
             if let v = self.qVirtual, let t = self.qTarget, CA.device(uid: t.uid) != nil {
-                self.handBackVolume(to: t)
+                if !self.volumeHandedBack { self.handBackVolume(to: t) }
                 if CA.defaultOutput == v { CA.setDefaultOutput(t.id) }
                 if CA.defaultSystemOutput == v { CA.setDefaultSystemOutput(t.id) }
             }
@@ -121,7 +161,7 @@ final class Router: ObservableObject {
         audioQueue.async {
             PAVEngineStop()
             if let t = self.qTarget, CA.device(uid: t.uid) != nil {
-                self.handBackVolume(to: t)
+                if !self.volumeHandedBack { self.handBackVolume(to: t); self.volumeHandedBack = true }
                 CA.setDefaultOutput(t.id)
                 CA.setDefaultSystemOutput(t.id)
             }
@@ -245,6 +285,15 @@ final class Router: ObservableObject {
         }
         let virtChanged = qVirtual != virt.id
         qVirtual = virt.id
+
+        // During a call the default output is a real device we chose. Someone else changing it (not macOS
+        // reacting to a device being plugged in or out) is the user's choice: respect it until the call ends.
+        if reason == .defaultChanged, case .routing(let id) = qCallState, id != 0, CA.defaultOutput != id,
+           Date().timeIntervalSince(lastDeviceListChange) >= 1.5 {
+            callLog.log("default output changed by the user during the call; leaving it alone")
+            qCallState = .overridden
+            publishCall()
+        }
         if virtChanged { watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); refreshCachedMaster() }
 
         // A device appeared (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
@@ -265,7 +314,8 @@ final class Router: ObservableObject {
         }
 
         let def = CA.defaultOutput
-        if def != virt.id, let picked = qRealDevices.first(where: { $0.id == def }) {
+        let routingCall: Bool = { if case .routing = qCallState { return true } else { return false } }()
+        if def != virt.id, !routingCall, let picked = qRealDevices.first(where: { $0.id == def }) {
             // The user (or macOS, e.g. headphones connected) selected a real device.
             // In custom-order mode, ignore macOS' automatic switch on connect and fall through to the priority list.
             let autoSwitch = Date().timeIntervalSince(lastDeviceListChange) < 1.5
@@ -296,9 +346,23 @@ final class Router: ObservableObject {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         guard let virt = qVirtual else { return }
         let changed = qTarget?.id != device.id
-        if changed, let old = qTarget, !volumeHandedBack { handBackVolume(to: old) }
+        // Which device should be the macOS default output (nil: leave it as the user set it).
+        let wantDefault: AudioObjectID?
+        switch qCallState {
+        case .none: wantDefault = virt
+        case .routing: wantDefault = device.id
+        case .overridden: wantDefault = nil
+        }
+        // Apps play straight to a real device (call): it keeps its own volume instead of running at full volume.
+        let direct = (wantDefault ?? CA.defaultOutput) != virt
+        if changed, let old = qTarget, !volumeHandedBack { handBackVolume(to: old); volumeHandedBack = true }
         qTarget = device
-        if changed || volumeHandedBack { takeOverVolume(from: device); volumeHandedBack = false }
+        if direct {
+            if !volumeHandedBack { handBackVolume(to: device) }
+            volumeHandedBack = true
+        } else if changed || volumeHandedBack {
+            takeOverVolume(from: device); volumeHandedBack = false
+        }
         publishDevices()
 
         // Match sample rates so nothing has to be resampled.
@@ -315,9 +379,60 @@ final class Router: ObservableObject {
             rateListener = (device.id, l)
         }
 
-        if CA.defaultOutput != virt { CA.setDefaultOutput(virt) }
-        if CA.defaultSystemOutput != virt { CA.setDefaultSystemOutput(virt) }
+        if let want = wantDefault, CA.defaultOutput != want {
+            callLog.log("default output -> \(want == virt ? "Per-App Volume" : device.name, privacy: .public)")
+            CA.setDefaultOutput(want)
+        }
+        if case .routing = qCallState { qCallState = .routing(device.id) }
+        if qCallState == .none, CA.defaultSystemOutput != virt { CA.setDefaultSystemOutput(virt) }
+        publishCall()
         restartEngineIfNeeded(force: changed || !PAVEngineIsRunning())
+    }
+
+    // MARK: Calls (audioQueue)
+
+    private func publishCall() {
+        let on = qCallState != .none && CA.defaultOutput != qVirtual
+        onMain { if self.inCall != on { self.inCall = on } }
+    }
+
+    private func micChanged(_ users: [String]?) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        onMain { if self.callUsers != users { self.callUsers = users } }
+        if users != nil {
+            callEndWork?.cancel(); callEndWork = nil
+            guard qCallState == .none, qVirtual != nil else { return }
+            callLog.log("call started: \(users!.joined(separator: ", "), privacy: .public)")
+            qCallState = .routing(0)
+            if let t = qTarget { applyTarget(t) }
+        } else if qCallState != .none, callEndWork == nil {
+            // Debounce: apps briefly stop and restart the mic (device changes, mute, reconfiguration).
+            let w = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.callEndWork = nil
+                self.endCall()
+            }
+            callEndWork = w
+            audioQueue.asyncAfter(deadline: .now() + callEndDelay, execute: w)
+        }
+    }
+
+    private func endCall() {
+        let s = qCallState
+        qCallState = .none
+        let def = CA.defaultOutput
+        switch s {
+        case .none: return
+        case .routing:
+            // Still the device we set (or one macOS picked when a device came or went): take it back.
+            callLog.log("call ended; back to Per-App Volume")
+            reevaluate(reason: .modeChanged)
+        case .overridden:
+            // Only take the output back if the user put it on Per-App Volume themselves.
+            callLog.log("call ended; output was changed by the user, leaving it")
+            if def == qVirtual { reevaluate(reason: .modeChanged) }
+        }
+        publishCall()
     }
 
     private func syncRate() {

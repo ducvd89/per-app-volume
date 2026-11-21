@@ -19,6 +19,13 @@ shows no orange or purple privacy indicator and asks for no permissions.
 - **Output switching that behaves like macOS:** plugged-in headphones, DACs and Bluetooth devices take over when
   they are new or were used more recently than the current output; unplugging falls back to the last used device.
   Or use your own priority order
+- **Calls use the real device:** while a calling app (FaceTime, Zoom, Teams, Slack, Discord, WhatsApp, Telegram,
+  Zalo…) uses the microphone, the macOS default output becomes your real speakers or headphones, so echo
+  cancellation and voice processing work as usual. Plugging or unplugging headphones during the call still switches
+  the output, and if you pick another output yourself it is left alone. A few seconds after the mic stops, output
+  goes back to Per-App Volume. Per-app volumes don't apply to the call meanwhile. It only reads whether the mic is
+  in use (no input stream, no permission, no orange dot). The list of calling apps can be edited in Settings
+  (macOS 14+; on macOS 13 any app using the mic counts), or the feature turned off
 - **Sample rates** from 44.1 kHz to 192 kHz, matched to the real device automatically
 - **Global shortcut** to open the panel (⌥⌘V by default). It uses a Carbon hotkey, so no Accessibility permission
 - **Open at Login**
@@ -97,6 +104,7 @@ embedded in `Contents/Resources/PerAppVolume.driver`. To install the driver from
 - `App/Sources/`: the SwiftUI menu bar app
   - `Router.swift`: chooses the output device, hands the volume over, starts and stops the engine
   - `DeviceSwitching.swift`: macOS' device switching rules
+  - `CallMode.swift`: notices calling apps using the microphone (HAL properties only)
   - `AppStore.swift`: the app list and the per-app gains sent to the driver
 
 ## Known issues

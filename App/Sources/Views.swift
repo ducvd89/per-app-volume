@@ -48,6 +48,11 @@ struct PopoverView: View {
                 StatusDot(state: router.state)
             }
             MasterRow(router: router)
+            if router.inCall, let t = router.target {
+                Label("In a call\(router.callUsers.map { " (\($0.joined(separator: ", ")))" } ?? ""): playing straight to \(t.name). Per-app volumes are paused.",
+                      systemImage: "phone.fill")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
     }
@@ -303,6 +308,7 @@ struct SettingsView: View {
                     }
                 }
             }
+            CallSection(router: router)
             Section("Virtual Audio Driver") {
                 DriverPanel(installer: installer)
             }
@@ -314,6 +320,75 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 640)
+    }
+}
+
+struct CallSection: View {
+    @ObservedObject var router: Router
+    @StateObject private var newID = Box("")
+
+    var body: some View {
+        Section("Calls") {
+            Toggle("Use the real output device during calls", isOn: $router.callModeEnabled)
+            Text("While an app uses the microphone for a call, macOS outputs straight to \(router.target?.name ?? "your speakers or headphones") so echo cancellation works. Per-app volumes don't apply until the call ends. Per-App Volume only reads whether the mic is in use; it never opens it.")
+                .font(.caption).foregroundStyle(.secondary)
+            if router.callModeEnabled {
+                if MicMonitor.hasProcessAPI {
+                    Toggle("Only for these apps", isOn: $router.callAppsOnly)
+                    if router.callAppsOnly { appList }
+                } else {
+                    Text("macOS 13: any app using the microphone counts as a call.").font(.caption).foregroundStyle(.secondary)
+                }
+                if let users = router.callUsers {
+                    Label("In a call now: \(users.joined(separator: ", "))", systemImage: "phone.fill").font(.caption)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var appList: some View {
+        ForEach(Array(router.callApps.enumerated()), id: \.offset) { idx, bid in
+            HStack {
+                Text(Self.name(of: bid)).lineLimit(1)
+                Text(bid).font(.caption).foregroundStyle(.tertiary).lineLimit(1)
+                Spacer()
+                Button { router.callApps.remove(at: idx) } label: { Image(systemName: "minus.circle") }
+                    .buttonStyle(.borderless)
+            }
+        }
+        HStack {
+            TextField("Bundle ID", text: $newID.v).onSubmit(add)
+            Button("Add", action: add).disabled(newID.v.trimmingCharacters(in: .whitespaces).isEmpty)
+            Menu("Running App") {
+                ForEach(runningApps, id: \.0) { bid, name in
+                    Button(name) { append(bid) }
+                }
+            }
+            .fixedSize()
+        }
+        Button("Restore Default Apps") { router.callApps = kDefaultCallApps }
+            .disabled(router.callApps == kDefaultCallApps)
+    }
+
+    private var runningApps: [(String, String)] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { a in a.bundleIdentifier.map { ($0, a.localizedName ?? $0) } }
+            .filter { !router.callApps.contains($0.0) }
+            .sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+    }
+
+    private func add() { append(newID.v); newID.v = "" }
+
+    private func append(_ id: String) {
+        let id = id.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty, !router.callApps.contains(id) else { return }
+        router.callApps.append(id)
+    }
+
+    private static func name(of bid: String) -> String {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) else { return bid }
+        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
     }
 }
 

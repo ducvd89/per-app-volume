@@ -85,8 +85,10 @@ enum CA {
 
     // MARK: Devices
 
-    static func outputChannelCount(_ id: AudioObjectID) -> Int {
-        var a = addr(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput)
+    static func outputChannelCount(_ id: AudioObjectID) -> Int { channelCount(id, scope: kAudioObjectPropertyScopeOutput) }
+
+    static func channelCount(_ id: AudioObjectID, scope: AudioObjectPropertyScope) -> Int {
+        var a = addr(kAudioDevicePropertyStreamConfiguration, scope)
         var size: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(id, &a, 0, nil, &size) == noErr, size > 0 else { return 0 }
         let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
