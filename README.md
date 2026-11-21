@@ -19,6 +19,8 @@ shows no orange or purple privacy indicator and asks for no permissions.
 - **Output switching that behaves like macOS:** plugged-in headphones, DACs and Bluetooth devices take over when
   they are new or were used more recently than the current output; unplugging falls back to the last used device.
   Or use your own priority order
+- **AirPods ear detection:** taking AirPods out of your ears pauses playback and putting them back in resumes it,
+  like macOS does when the AirPods are the output (macOS skips this when the default output is a virtual device)
 - **Calls use the real device:** while a calling app (FaceTime, Zoom, Teams, Slack, Discord, WhatsApp, Telegram,
   Zalo…) uses the microphone, the macOS default output becomes your real speakers or headphones, so echo
   cancellation and voice processing work as usual. Plugging or unplugging headphones during the call still switches

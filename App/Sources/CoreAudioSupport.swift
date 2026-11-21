@@ -110,6 +110,18 @@ enum CA {
         }
     }
 
+    /// AirPods in-ear state (private Bluetooth HAL properties): 'iesb' changes whenever a bud goes in or out;
+    /// 'iesp' / 'iess' are the primary / secondary bud (1 = in ear, 2 = out of ear, other = in the case / unknown).
+    static let kPropInEarStatus: AudioObjectPropertySelector = 0x6965_7362   // 'iesb'
+    private static let kPropInEarPrimary: AudioObjectPropertySelector = 0x6965_7370   // 'iesp'
+    private static let kPropInEarSecondary: AudioObjectPropertySelector = 0x6965_7373   // 'iess'
+
+    /// How many buds are in the ears, or nil for devices without ear detection.
+    static func budsInEar(_ dev: AudioObjectID) -> Int? {
+        guard has(dev, kPropInEarStatus) else { return nil }
+        return [kPropInEarPrimary, kPropInEarSecondary].filter { (get(dev, $0, default: UInt32(0)) ?? 0) == 1 }.count
+    }
+
     static func device(uid: String) -> AudioObjectID? {
         allOutputDevices().first { $0.uid == uid }?.id
     }

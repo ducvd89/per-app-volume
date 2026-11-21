@@ -300,6 +300,7 @@ final class Router: ObservableObject {
         // macOS won't switch by itself, so apply its rules here (see DeviceSwitching).
         let currentUIDs = Set(qRealDevices.map(\.uid))
         defer { knownUIDs = currentUIDs }
+        defer { resumeAfterEarIfNeeded() }
         if qMode == .followSystem, reason == .devicesChanged, let known = knownUIDs {
             let appeared = qRealDevices
                 .filter { !known.contains($0.uid) && DeviceSwitching.canTakeOverOnConnect(transport: $0.transport) }
@@ -357,6 +358,7 @@ final class Router: ObservableObject {
         let direct = (wantDefault ?? CA.defaultOutput) != virt
         if changed, let old = qTarget, !volumeHandedBack { handBackVolume(to: old); volumeHandedBack = true }
         qTarget = device
+        watchEars(device)
         if direct {
             if !volumeHandedBack { handBackVolume(to: device) }
             volumeHandedBack = true
@@ -387,6 +389,54 @@ final class Router: ObservableObject {
         if qCallState == .none, CA.defaultSystemOutput != virt { CA.setDefaultSystemOutput(virt) }
         publishCall()
         restartEngineIfNeeded(force: changed || !PAVEngineIsRunning())
+    }
+
+    // MARK: AirPods ear detection (audioQueue)
+    // macOS pauses playback when AirPods leave your ears only if the default output *is* the AirPods
+    // (mediaremoted logs "Not playing to device" otherwise). With our virtual device as the default nobody
+    // pauses, and once both buds are out macOS hides the AirPods, so audio would jump to the speakers.
+    // So watch the AirPods' in-ear state ourselves and pause / resume like macOS does.
+
+    private var earWatch: (id: AudioObjectID, uid: String, inEar: Int, listener: AudioObjectPropertyListenerBlock)?
+    /// We paused because buds were taken out; resume when as many are back in, within `earResumeWindow`.
+    private var earPaused: (uid: String, inEarBefore: Int, at: Date)?
+    private let earResumeWindow: TimeInterval = 60
+
+    /// Follow the in-ear state of the current output (kept while the AirPods are hidden, i.e. out of the ears).
+    private func watchEars(_ device: AudioDevice) {
+        guard earWatch?.id != device.id, let n = CA.budsInEar(device.id) else { return }
+        if let w = earWatch { CA.unlisten(w.id, CA.kPropInEarStatus, queue: audioQueue, w.listener) }
+        let id = device.id
+        let l = CA.listen(id, CA.kPropInEarStatus, queue: audioQueue) { [weak self] in self?.earsChanged(id) }
+        earWatch = (id, device.uid, n, l)
+    }
+
+    private func earsChanged(_ id: AudioObjectID) {
+        guard let w = earWatch, w.id == id, let n = CA.budsInEar(id) else { return }
+        let before = w.inEar
+        earWatch?.inEar = n
+        guard n != before else { return }
+        volLog.log("in-ear buds: \(before) -> \(n)")
+        if n < before, earPaused == nil, qTarget?.id == id, qCallState == .none, virtualIsRunning() {
+            volLog.log("AirPods taken out of the ears: pausing playback")
+            NowPlaying.send(.pause)
+            earPaused = (w.uid, before, Date())
+        }
+        resumeAfterEarIfNeeded()
+    }
+
+    private func resumeAfterEarIfNeeded() {
+        guard let p = earPaused else { return }
+        guard let w = earWatch, w.uid == p.uid, CA.string(w.id, kAudioDevicePropertyDeviceUID) == p.uid else {
+            earPaused = nil   // disconnected (back in the case): don't resume later
+            return
+        }
+        guard w.inEar >= p.inEarBefore, qTarget?.uid == p.uid, qRealDevices.contains(where: { $0.uid == p.uid }) else { return }
+        earPaused = nil
+        if Date().timeIntervalSince(p.at) < earResumeWindow {
+            volLog.log("AirPods back in the ears: resuming playback")
+            NowPlaying.send(.play)
+        }
     }
 
     // MARK: Calls (audioQueue)
@@ -531,4 +581,16 @@ final class Router: ObservableObject {
         CA.setHardwareVolume(id, cachedMaster.volume)
         if cachedMaster.muted { CA.setHardwareMute(id, true) }
     }
+}
+
+/// Play/pause the system's Now Playing app (MediaRemote, the same path as the keyboard media keys).
+enum NowPlaying {
+    enum Command: UInt32 { case play = 0, pause = 1 }
+    private typealias SendFn = @convention(c) (UInt32, CFDictionary?) -> Bool
+    private static let sendFn: SendFn? = {
+        guard let h = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY),
+              let sym = dlsym(h, "MRMediaRemoteSendCommand") else { return nil }
+        return unsafeBitCast(sym, to: SendFn.self)
+    }()
+    static func send(_ c: Command) { _ = sendFn?(c.rawValue, nil) }
 }
