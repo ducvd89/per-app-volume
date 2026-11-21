@@ -289,7 +289,7 @@ struct SettingsView: View {
                     ForEach(OutputMode.allCases) { Text($0.title).tag($0) }
                 }
                 Text(router.mode == .followSystem
-                     ? "Switches like macOS: to the device you pick in Control Center or System Settings, to headphones when you plug them in, and back to the last used device when they're unplugged."
+                     ? "Uses the device that connected last (headphones, DAC, Bluetooth) or the one you pick in Control Center or System Settings. When it disconnects, goes back to the most recently connected device that's still connected."
                      : "Always uses the first connected device in the list below.")
                     .font(.caption).foregroundStyle(.secondary)
                 ForEach(Array(router.priority.enumerated()), id: \.element) { idx, uid in

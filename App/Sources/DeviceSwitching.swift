@@ -1,14 +1,13 @@
 import CoreAudio
 
-/// macOS' output-device switching rules, as pure functions so they can be tested.
+/// Output-device switching rules, as pure functions so they can be tested.
 ///
-/// macOS keeps a most-recently-used history of output devices (newest first):
-/// - Choosing a device (Control Center, Sound settings, our menu) moves it to the front.
-/// - When a device appears, it becomes the output if it was never seen before, or if it was used more
-///   recently than the current output (e.g. headphones you were using are plugged back in).
-///   A device you deliberately switched away from does not grab the output back when it reconnects.
-/// - When the current output disappears, macOS falls back to the most recently used device that is
-///   still connected. Automatic fallbacks do not change the history.
+/// The app keeps the output devices in connection order (newest first):
+/// - A device that connects (headphones plugged in, a USB DAC, Bluetooth headphones connecting, AirPods put
+///   back in your ears) moves to the front and becomes the output.
+/// - Choosing a device yourself (Control Center, Sound settings, our menu) also moves it to the front.
+/// - Devices that stay connected keep their place. When the current output disappears, the output falls back
+///   to the most recently connected (or chosen) device that is still connected; fallbacks don't change the order.
 enum DeviceSwitching {
     /// Kinds of devices that take over the output when they appear. Virtual and aggregate devices
     /// (drivers being installed) and AirPlay endpoints never do.
@@ -18,20 +17,21 @@ enum DeviceSwitching {
           kAudioDeviceTransportTypeUnknown].contains(transport)
     }
 
-    /// Which newly appeared device (if any) should become the output.
-    /// - Parameters:
-    ///   - appeared: UIDs of devices that just appeared (and are allowed to take over).
-    ///   - history: MRU history before this event, newest first.
-    ///   - current: UID of the current output, if it is still connected.
-    static func deviceToSwitchTo(appeared: [String], history: [String], current: String?) -> String? {
+    /// The new order after devices connected: they move to the front (keeping their previous relative order),
+    /// everything else keeps its place.
+    static func order(afterConnecting appeared: [String], history: [String]) -> [String] {
         func rank(_ uid: String) -> Int { history.firstIndex(of: uid) ?? -1 }   // never seen = newest
-        guard let best = appeared.min(by: { rank($0) < rank($1) }) else { return nil }
-        guard let current else { return best }
-        let currentRank = history.firstIndex(of: current) ?? Int.max
-        return rank(best) < currentRank ? best : nil
+        let front = appeared.sorted { rank($0) < rank($1) }
+        return front + history.filter { !front.contains($0) }
     }
 
-    /// Fallback when the current output is gone: most recently used device still connected.
+    /// Which newly connected device becomes the output: the newest one (if several connect at once,
+    /// the one connected or chosen most recently before).
+    static func deviceToSwitchTo(appeared: [String], history: [String]) -> String? {
+        order(afterConnecting: appeared, history: history).first { appeared.contains($0) }
+    }
+
+    /// Fallback when the current output is gone: most recently connected device still connected.
     static func fallback(history: [String], connected: [String]) -> String? {
         history.first { connected.contains($0) } ?? connected.first
     }

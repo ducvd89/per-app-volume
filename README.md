@@ -16,9 +16,9 @@ shows no orange or purple privacy indicator and asks for no permissions.
 - **Level meter** for each app
 - **Master volume** follows the keyboard volume keys (with the macOS HUD). 100% in the app is the real
   maximum of your output device: the device runs at full volume and its previous level becomes the master volume
-- **Output switching that behaves like macOS:** plugged-in headphones, DACs and Bluetooth devices take over when
-  they are new or were used more recently than the current output; unplugging falls back to the last used device.
-  Or use your own priority order
+- **Output switching:** the device that connected last (headphones, DACs, Bluetooth) or that you pick in Control
+  Center becomes the output; unplugging it falls back to the most recently connected device that's still connected,
+  so devices that stay connected keep their order. Or use your own priority order
 - **AirPods ear detection:** taking AirPods out of your ears pauses playback and putting them back in resumes it,
   like macOS does when the AirPods are the output (macOS skips this when the default output is a virtual device)
 - **Calls use the real device:** while a calling app (FaceTime, Zoom, Teams, Slack, Discord, WhatsApp, Telegram,
@@ -105,7 +105,7 @@ embedded in `Contents/Resources/PerAppVolume.driver`. To install the driver from
   layout (`PAVShared.h`)
 - `App/Sources/`: the SwiftUI menu bar app
   - `Router.swift`: chooses the output device, hands the volume over, starts and stops the engine
-  - `DeviceSwitching.swift`: macOS' device switching rules
+  - `DeviceSwitching.swift`: the output switching rules
   - `CallMode.swift`: notices calling apps using the microphone (HAL properties only)
   - `AppStore.swift`: the app list and the per-app gains sent to the driver
 

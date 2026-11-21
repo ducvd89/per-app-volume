@@ -14,7 +14,7 @@ enum OutputMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .followSystem: return "Follow macOS output device"
+        case .followSystem: return "Newest connected device"
         case .customOrder:  return "Use custom priority order"
         }
     }
@@ -296,8 +296,8 @@ final class Router: ObservableObject {
         }
         if virtChanged { watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); refreshCachedMaster() }
 
-        // A device appeared (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
-        // macOS won't switch by itself, so apply its rules here (see DeviceSwitching).
+        // A device connected (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
+        // macOS won't switch by itself, so apply the rules here (see DeviceSwitching).
         let currentUIDs = Set(qRealDevices.map(\.uid))
         defer { knownUIDs = currentUIDs }
         defer { resumeAfterEarIfNeeded() }
@@ -305,10 +305,10 @@ final class Router: ObservableObject {
             let appeared = qRealDevices
                 .filter { !known.contains($0.uid) && DeviceSwitching.canTakeOverOnConnect(transport: $0.transport) }
                 .map(\.uid)
-            let current = qTarget.flatMap { currentUIDs.contains($0.uid) ? $0.uid : nil }
-            if let uid = DeviceSwitching.deviceToSwitchTo(appeared: appeared, history: historyBefore, current: current),
+            if let uid = DeviceSwitching.deviceToSwitchTo(appeared: appeared, history: historyBefore),
                let dev = qRealDevices.first(where: { $0.uid == uid }) {
-                promote(uid)
+                let front = DeviceSwitching.order(afterConnecting: appeared, history: historyBefore).filter(appeared.contains)
+                qPriority = front + qPriority.filter { !front.contains($0) }
                 applyTarget(dev)
                 return
             }
