@@ -58,6 +58,7 @@ static os_log_t           gLog;
 // IO-thread-owned
 static uint64_t gR = 0;
 static bool     gPrimed = false;
+static uint64_t gPlayedEnd = 0;             // never re-prime before this position: those frames were already played
 static uint32_t gTarget = 2048, gTargetMin = 512, gTargetMax = 8192;
 static uint32_t gMinSlack = UINT32_MAX;     // smallest spare frames seen since the last adapt step
 static uint64_t gCyclesClean = 0;           // IO cycles since the last underrun / adapt step
@@ -200,7 +201,7 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
 
     if (gShm) {
         uint32_t g = atomic_load_explicit(&gShm->generation, memory_order_acquire);
-        if (g != gGen) { gGen = g; gPrimed = false; }
+        if (g != gGen) { gGen = g; gPrimed = false; gPlayedEnd = 0; }
     }
     uint64_t w = atomic_load_explicit(gSrcW, memory_order_acquire);
     uint64_t r = gR;
@@ -226,12 +227,14 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
 
     if (!gPrimed) {
         if (gChunk == 0) return noErr;                       // wait until we've seen one write
-        if (w < (uint64_t)gTarget + frames) return noErr;
+        // After an underrun, wait for a full target of *new* audio. Re-priming on the old data would replay the
+        // last sound over and over once the writer stops (an app killed mid-playback) until the engine stops.
+        if (w < gPlayedEnd + gTarget + frames) return noErr;
         r = w - gTarget - frames;
         gPrimed = true;
         gLockCycles = 0; gPendingRaise = 0;
     }
-    if (r > w) { gPrimed = false; gR = w; return noErr; }   // writer restarted
+    if (r > w) { gPrimed = false; gR = w; gPlayedEnd = 0; return noErr; }   // writer restarted
     uint64_t avail = w - r;
 
     // Big backlog (stall / device change): jump forward.
@@ -276,6 +279,7 @@ static OSStatus IOProc(AudioObjectID dev, const AudioTimeStamp* now, const Audio
         }
         gR = r + n;
         gPrimed = false;
+        gPlayedEnd = gR;
         atomic_fetch_add(&gUnderruns, 1);
         Grow();
         atomic_store_explicit(&gTargetPub, gTarget, memory_order_relaxed);
@@ -389,7 +393,7 @@ OSStatus PAVEngineStart(AudioObjectID virtualDevice, AudioObjectID outputDevice)
     gCyclesPerStep = (uint32_t)(20.0 * gRate / bufFrames);   // ~20 s between shrink steps
 
     ComputeChannelMap(outputDevice);
-    gPrimed = false; gR = 0; gMinSlack = UINT32_MAX; gCyclesClean = 0; gLastW = 0; gChunk = 0;
+    gPrimed = false; gR = 0; gPlayedEnd = 0; gMinSlack = UINT32_MAX; gCyclesClean = 0; gLastW = 0; gChunk = 0;
     atomic_store(&gUnderruns, 0);
 
     if (AttachToDriver(virtualDevice)) {
