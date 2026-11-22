@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         store.refresh()
         installer.onChange = { [weak self] in self?.router.rescan(); self?.store.refresh() }
         installer.willUninstall = { [weak self] in self?.router.releaseOutput() }
+        installer.uninstallFailed = { [weak self] in self?.router.reclaimOutput() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {

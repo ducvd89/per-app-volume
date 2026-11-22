@@ -5,12 +5,15 @@ cd "$(dirname "$0")"
 BUILD=build
 ARCHS="-arch arm64 -arch x86_64"
 MINOS=13.0
+# Keep the path of the source folder out of the binaries.
+CMAP="-ffile-prefix-map=$PWD=."
+SMAP="-file-prefix-map $PWD=."
 rm -rf "$BUILD"; mkdir -p "$BUILD/obj"
 
 echo "==> Driver"
 DRV="$BUILD/PerAppVolume.driver"
 mkdir -p "$DRV/Contents/MacOS" "$DRV/Contents/Resources"
-clang $ARCHS -mmacosx-version-min=$MINOS -O2 -Wall -bundle \
+clang $ARCHS -mmacosx-version-min=$MINOS -O2 -Wall "$CMAP" -bundle \
   -framework CoreAudio -framework CoreFoundation -framework IOSurface -I App/Engine \
   -o "$DRV/Contents/MacOS/PerAppVolume" Driver/PerAppVolumeDriver.c
 cp Driver/Info.plist "$DRV/Contents/Info.plist"
@@ -20,8 +23,8 @@ echo "==> App"
 APP="$BUILD/Per-App Volume.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for A in arm64 x86_64; do
-  clang -arch $A -mmacosx-version-min=$MINOS -O2 -Wall -c App/Engine/PAVEngine.c -o "$BUILD/obj/PAVEngine-$A.o"
-  swiftc -O -swift-version 5 -target $A-apple-macos$MINOS \
+  clang -arch $A -mmacosx-version-min=$MINOS -O2 -Wall "$CMAP" -c App/Engine/PAVEngine.c -o "$BUILD/obj/PAVEngine-$A.o"
+  swiftc -O -swift-version 5 -target $A-apple-macos$MINOS $SMAP \
     -import-objc-header App/Engine/PAVEngine.h \
     App/Sources/*.swift "$BUILD/obj/PAVEngine-$A.o" \
     -framework CoreAudio -framework IOSurface -framework AppKit -framework SwiftUI -framework Carbon -framework ServiceManagement \

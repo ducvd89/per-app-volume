@@ -113,12 +113,21 @@ final class MicMonitor {
         }
     }
 
-    /// Some input device is running for someone. A device that also has outputs (USB headset) counts
-    /// only when it isn't running just because our engine plays to it.
+    /// Some input device is running for someone. A device that also has outputs (USB headset) is running
+    /// whenever our engine plays to it. On macOS 14+ that doesn't matter: the per-process check says exactly
+    /// who uses the mic, so such a device always counts (skipping it would hide a call that starts while
+    /// anything plays, even the ringtone). On macOS 13 there is no per-process check, so it is skipped.
     private func anyInputRunning() -> Bool {
         deviceListeners.keys.contains { d in
-            (CA.get(d, kAudioDevicePropertyDeviceIsRunningSomewhere, default: UInt32(0)) ?? 0) != 0 && !isOurOutput(d)
+            guard (CA.get(d, kAudioDevicePropertyDeviceIsRunningSomewhere, default: UInt32(0)) ?? 0) != 0 else { return false }
+            return Self.hasProcessAPI || !isOurOutput(d)
         }
+    }
+
+    /// Look again (the engine started or stopped, which changes what `isOurOutput` answers).
+    func refresh() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        if started { evaluate() }
     }
 
     // MARK: Processes (macOS 14+)

@@ -20,6 +20,8 @@ final class DriverInstaller: ObservableObject {
     var onChange: (() -> Void)?
     /// Called right before uninstall so we can hand output back to the real device.
     var willUninstall: (() -> Void)?
+    /// Called when the uninstall was cancelled or failed, so output can go through the driver again.
+    var uninstallFailed: (() -> Void)?
 
     init() { refresh() }
 
@@ -53,7 +55,7 @@ final class DriverInstaller: ObservableObject {
     func uninstall() {
         willUninstall?()
         let cmd = "/bin/rm -rf \(q(Self.installedPath)); \(restartCoreAudio)"
-        run(cmd, success: "Driver removed.")
+        run(cmd, success: "Driver removed.") { [weak self] ok in if !ok { self?.uninstallFailed?() } }
     }
 
     // `launchctl kickstart` is refused for coreaudiod (and AirPlayXPCHelper) while SIP is on, so just kill
@@ -67,7 +69,7 @@ final class DriverInstaller: ObservableObject {
     /// Single-quote for the shell.
     private func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-    private func run(_ shell: String, success: String) {
+    private func run(_ shell: String, success: String, completion: ((Bool) -> Void)? = nil) {
         busy = true; message = nil; isError = false
         // Escape for an AppleScript string literal.
         let lit = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -85,6 +87,7 @@ final class DriverInstaller: ObservableObject {
                     self.message = success
                     self.isError = false
                 }
+                completion?(err == nil)
                 self.refresh()
                 // coreaudiod needs a moment to come back and publish the new device.
                 for delay in [0.5, 2.0, 4.0] {

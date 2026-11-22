@@ -8,7 +8,8 @@ shows no orange or purple privacy indicator and asks for no permissions.
 ## Features
 
 - **Per-app volume** from 0 to 200% (above 100% is a boost), plus mute for each app
-- **Remembers volumes** per app (by bundle ID) and re-applies them when the app comes back
+- **Remembers volumes** per app (by bundle ID) and re-applies them when the app comes back, from the first
+  sound it makes
 - **Groups helper processes** under their app (Chrome Helper → Chrome, WebKit → Safari, game launchers → game)
 - **Clean list:** shows the running apps (with windows) that have ever played audio, plus pinned apps;
   system services are never listed
@@ -28,7 +29,8 @@ shows no orange or purple privacy indicator and asks for no permissions.
   goes back to Per-App Volume. Per-app volumes don't apply to the call meanwhile. It only reads whether the mic is
   in use (no input stream, no permission, no orange dot). The list of calling apps can be edited in Settings
   (macOS 14+; on macOS 13 any app using the mic counts), or the feature turned off
-- **Sample rates** from 44.1 kHz to 192 kHz, matched to the real device automatically
+- **Sample rates** from 8 kHz to 192 kHz, matched to the real device automatically (including the low rates
+  Bluetooth headsets switch to while their microphone is on); any other rate is converted
 - **Global shortcut** to open the panel (⌥⌘V by default). It uses a Carbon hotkey, so no Accessibility permission
 - **Open at Login**
 
@@ -40,7 +42,7 @@ Measured on an Apple Silicon MacBook Pro while playing audio:
 |---|---|
 | coreaudiod CPU | ~1% |
 | Per-App Volume CPU | ~0.1% |
-| Added latency | ~13 ms over the output buffer (~24 ms total) |
+| Added latency | ~13 ms over the output buffer (~24 ms total) with apps that use 512-frame buffers; an app that asks for a bigger buffer adds its size while it plays |
 | Dropouts with every core at 100% | 0 |
 | Resampled audio (clock drift) | none: the virtual clock is locked to the device |
 
@@ -64,8 +66,13 @@ Apps (Spotify, Safari, games…) ──► "Per-App Volume" virtual output devic
 - **Bit-perfect at 100%:** the virtual device's clock is locked to the real device's clock. The app publishes the
   real device's measured rate (plus a tiny correction from the buffer fill level) in the shared ring, and the
   driver generates its timestamps from it, so samples never need to be resampled to make up for clock drift.
-- The output buffer adapts to the size of the chunks the driver writes, grows after a dropout and slowly shrinks
-  back after long clean stretches.
+- The output buffer adapts to the size of the chunks the driver writes (the driver reports it in the shared
+  ring), grows after a dropout and shrinks back: within seconds when the chunks get smaller, slowly after a dropout.
+- The virtual device reports the latency of everything behind it (the app's buffer plus the real device), so
+  players keep picture and sound in sync as they would on the real device.
+- The driver only hands the mix, the shared ring and its settings to the Per-App Volume app. It recognizes the app
+  by the bundle ID coreaudiod reports for the calling process: that keeps other processes from reading system
+  audio through the driver, but it is not a signature check (the app is not signed with a Developer ID).
 - If the shared ring can't be attached, the app falls back to pulling the mix through a custom device property.
 - Every Core Audio call in the app runs on a background queue, so the UI stays responsive even when coreaudiod is slow.
 
@@ -98,18 +105,36 @@ This produces `dist/Per-App Volume.app`, `dist/Per-App-Volume.zip` and `dist/Per
 embedded in `Contents/Resources/PerAppVolume.driver`. To install the driver from Terminal instead of the app, run
 `sudo ./scripts/install-driver.sh`.
 
+Copy the built app to `/Applications` before running it. If another copy with the same bundle ID is already
+installed there, macOS treats the menu bar icon of a copy started from `dist/` as anonymous: it forgets the
+icon's position on every launch and menu bar managers (Thaw, Ice…) can't move it.
+
+## Tests
+
+```bash
+./scripts/test.sh
+```
+
+Runs the engine against a simulated driver, the driver's entry points against a stand-in host, and the app's
+switching rules. Nothing is installed and no audio device is touched.
+
 ## Project layout
 
 - `Driver/PerAppVolumeDriver.c`: the AudioServerPlugIn (virtual device, per-client gain, shared ring)
-- `App/Engine/`: the realtime engine that plays the mix on the real device (`PAVEngine.c`) and the shared ring
-  layout (`PAVShared.h`)
+- `App/Engine/`: the realtime engine that plays the mix on the real device (`PAVEngine.c`), the shared ring
+  layout (`PAVShared.h`) and the constants the driver and the app share (`PAVProtocol.h`)
 - `App/Sources/`: the SwiftUI menu bar app
   - `Router.swift`: chooses the output device, hands the volume over, starts and stops the engine
   - `DeviceSwitching.swift`: the output switching rules
   - `CallMode.swift`: notices calling apps using the microphone (HAL properties only)
   - `AppStore.swift`: the app list and the per-app gains sent to the driver
+- `tests/`: the tests, run by `scripts/test.sh`
 
 ## Known issues
+
+- While Per-App Volume forwards audio, the real device runs at full volume and the app applies your level. If the
+  app is force-quit or crashes it can't put the device's own level back: open it again before playing straight to
+  that device.
 
 - Every coreaudiod restart (installing or removing a driver) makes macOS' AirPlay helper register its drivers twice
   as often. After many restarts coreaudiod can get stuck at 100% CPU. This is a macOS bug; a reboot clears it.

@@ -68,6 +68,10 @@ final class Router: ObservableObject {
     private var lastDeviceListChange = Date.distantPast
     private var listeners: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope, AudioObjectPropertyListenerBlock)] = []
     private var rateListener: (AudioObjectID, AudioObjectPropertyListenerBlock)?
+    /// Output was handed to the real device on purpose (the driver is being removed): don't take it back.
+    private var qReleased = false
+    /// What we last told the driver to report as its latency.
+    private var lastLatency: (virt: AudioObjectID, frames: Int)?
     private var stopWork: DispatchWorkItem?
     private var napBlocker: NSObjectProtocol?
     /// Real output devices seen so far (nil until the first scan), to detect newly plugged-in ones.
@@ -118,18 +122,47 @@ final class Router: ObservableObject {
     // MARK: Public API (call from main)
 
     func start() {
-        audioQueue.async {
-            let sys = AudioObjectID(kAudioObjectSystemObject)
-            self.addListener(sys, kAudioHardwarePropertyDevices) { [weak self] in
-                self?.lastDeviceListChange = Date()
-                self?.reevaluate(reason: .devicesChanged)
-            }
-            self.addListener(sys, kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
-                self?.reevaluate(reason: .defaultChanged)
-            }
-            self.reevaluate(reason: .launch)
-            self.mic.start()
+        audioQueue.async { [self] in
+            addSystemListeners()
+            reevaluate(reason: .launch)
+            mic.start()
         }
+    }
+
+    private func addSystemListeners() {
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        addListener(sys, kAudioHardwarePropertyDevices) { [weak self] in
+            self?.lastDeviceListChange = Date()
+            self?.reevaluate(reason: .devicesChanged)
+        }
+        addListener(sys, kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
+            self?.reevaluate(reason: .defaultChanged)
+        }
+        addListener(sys, kAudioHardwarePropertyServiceRestarted) { [weak self] in
+            self?.serviceRestarted()
+        }
+    }
+
+    /// coreaudiod restarted (driver update, crash). Object IDs, listeners and everything the driver held (the
+    /// shared ring, the gain table, the latency) are gone: set it all up again.
+    private func serviceRestarted() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        volLog.log("coreaudiod restarted: setting up again")
+        PAVEngineStop(); setPlaying(false)
+        stopWork?.cancel(); stopWork = nil
+        for (obj, sel, scope, l) in listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
+        listeners.removeAll()
+        if let (dev, l) = rateListener { CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l) }
+        rateListener = nil
+        if let w = earWatch { CA.unlisten(w.id, CA.kPropInEarStatus, queue: audioQueue, w.listener) }
+        earWatch = nil
+        mic.stop()
+        watchedVirtual = nil
+        lastLatency = nil
+        addSystemListeners()
+        lastDeviceListChange = Date()
+        reevaluate(reason: .devicesChanged)
+        mic.start()
     }
 
     /// Restore the real device as macOS default (called on quit). Waits at most `timeout` for coreaudiod.
@@ -142,10 +175,13 @@ final class Router: ObservableObject {
             for (obj, sel, scope, l) in self.listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
             self.listeners.removeAll()
             if let (dev, l) = self.rateListener { CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l) }
-            if let v = self.qVirtual, let t = self.qTarget, CA.device(uid: t.uid) != nil {
-                if !self.volumeHandedBack { self.handBackVolume(to: t) }
-                if CA.defaultOutput == v { CA.setDefaultOutput(t.id) }
-                if CA.defaultSystemOutput == v { CA.setDefaultSystemOutput(t.id) }
+            if let t = self.qTarget, let id = CA.device(uid: t.uid) {
+                // Volume first, then the switch: the device must not be the default while still at full volume.
+                if !self.volumeHandedBack, self.handBackVolume(to: t) { self.volumeHandedBack = true }
+                if let v = self.qVirtual {
+                    if CA.defaultOutput == v { CA.setDefaultOutput(id) }
+                    if CA.defaultSystemOutput == v { CA.setDefaultSystemOutput(id) }
+                }
             }
             done.signal()
         }
@@ -156,18 +192,32 @@ final class Router: ObservableObject {
     func rescan() { audioQueue.async { self.reevaluate(reason: .devicesChanged) } }
 
     /// Stop forwarding and make the real device the macOS default again (before uninstalling the driver).
+    /// Stays that way until the driver is gone or `reclaimOutput()` is called: without that, our own
+    /// default-output listener would see the real device become the default and route it straight back.
     func releaseOutput(timeout: TimeInterval = 3) {
         let done = DispatchSemaphore(value: 0)
         audioQueue.async {
-            PAVEngineStop()
+            self.qReleased = true
+            self.stopWork?.cancel(); self.stopWork = nil
+            PAVEngineStop(); self.setPlaying(false)
+            self.publishState(.idle)
             if let t = self.qTarget, CA.device(uid: t.uid) != nil {
-                if !self.volumeHandedBack { self.handBackVolume(to: t); self.volumeHandedBack = true }
+                if !self.volumeHandedBack, self.handBackVolume(to: t) { self.volumeHandedBack = true }
                 CA.setDefaultOutput(t.id)
                 CA.setDefaultSystemOutput(t.id)
             }
             done.signal()
         }
         _ = done.wait(timeout: .now() + timeout)
+    }
+
+    /// The driver stays after all (uninstall cancelled or failed): route through it again.
+    func reclaimOutput() {
+        audioQueue.async {
+            guard self.qReleased else { return }
+            self.qReleased = false
+            self.reevaluate(reason: .modeChanged)
+        }
     }
 
     func choose(_ device: AudioDevice) {
@@ -246,6 +296,13 @@ final class Router: ObservableObject {
         listeners.append((obj, sel, scope, l))
     }
 
+    private func dropVirtualListeners() {
+        guard let old = watchedVirtual else { return }
+        for (obj, sel, scope, l) in listeners where obj == old { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
+        listeners.removeAll { $0.0 == old }
+        watchedVirtual = nil
+    }
+
     private func setPlaying(_ on: Bool) {
         if on, napBlocker == nil {
             // Keeps App Nap from throttling us while audio plays.
@@ -273,17 +330,26 @@ final class Router: ObservableObject {
         for d in qRealDevices where !qPriority.contains(d.uid) { qPriority.append(d.uid) }
 
         guard let virt = qDevices.first(where: { $0.isVirtualRouter }) else {
-            // Virtual device gone (driver reinstall / coreaudiod restart): give the real device its level back
+            // Virtual device gone (driver removed / coreaudiod restarting): give the real device its level back
             // right away, otherwise it would play at the full volume we set while forwarding.
-            if qVirtual != nil, let t = qTarget { handBackVolume(to: t); volumeHandedBack = true }
+            // The virtual device's ID is dead (or already belongs to another device), so forget it first: the
+            // level to restore is the one we cached, not whatever that ID answers now.
             qVirtual = nil
+            dropVirtualListeners()
+            qReleased = false
             PAVEngineStop(); setPlaying(false)
             publishState(.driverMissing)
+            if !volumeHandedBack, let t = qTarget {
+                // If the device isn't back yet (coreaudiod still starting), keep it as the target and try
+                // again on the next device change instead of leaving it at full volume.
+                guard handBackVolume(to: t) else { return }
+                volumeHandedBack = true
+            }
             let def = CA.defaultOutput
             qTarget = qRealDevices.first { $0.id == def }
             return
         }
-        let virtChanged = qVirtual != virt.id
+        let virtChanged = watchedVirtual != virt.id
         qVirtual = virt.id
 
         // During a call the default output is a real device we chose. Someone else changing it (not macOS
@@ -294,7 +360,17 @@ final class Router: ObservableObject {
             qCallState = .overridden
             publishCall()
         }
-        if virtChanged { watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); refreshCachedMaster() }
+        if virtChanged {
+            dropVirtualListeners()   // the ones on the previous ID (before a coreaudiod restart)
+            watchedVirtual = virt.id
+            lastLatency = nil
+            watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); watchVirtualRate(virt.id); refreshCachedMaster()
+        }
+        if qReleased {
+            let def = CA.defaultOutput
+            if let d = qRealDevices.first(where: { $0.id == def }) { qTarget = d }
+            return
+        }
 
         // A device connected (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
         // macOS won't switch by itself, so apply the rules here (see DeviceSwitching).
@@ -345,7 +421,7 @@ final class Router: ObservableObject {
 
     private func applyTarget(_ device: AudioDevice) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        guard let virt = qVirtual else { return }
+        guard let virt = qVirtual, !qReleased else { return }
         let changed = qTarget?.id != device.id
         // Which device should be the macOS default output (nil: leave it as the user set it).
         let wantDefault: AudioObjectID?
@@ -367,8 +443,9 @@ final class Router: ObservableObject {
         }
         publishDevices()
 
-        // Match sample rates so nothing has to be resampled.
+        // Match sample rates so nothing has to be resampled, and report the real path's latency.
         syncRate()
+        if !direct { syncLatency() }
         if let (dev, l) = rateListener, dev != device.id || changed {
             CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l)
             rateListener = nil
@@ -376,6 +453,7 @@ final class Router: ObservableObject {
         if rateListener == nil {
             let l = CA.listen(device.id, kAudioDevicePropertyNominalSampleRate, queue: audioQueue) { [weak self] in
                 self?.syncRate()
+                self?.syncLatency()
                 self?.restartEngineIfNeeded(force: true)
             }
             rateListener = (device.id, l)
@@ -485,13 +563,48 @@ final class Router: ObservableObject {
         publishCall()
     }
 
+    /// Run the virtual device at the real device's rate (or the closest one the driver offers; the engine
+    /// converts the rest, see PAVEngine.c).
     private func syncRate() {
-        guard let virt = qVirtual, let t = qTarget else { return }
+        guard let virt = qVirtual, let t = qTarget, !qReleased else { return }
         let r = CA.sampleRate(t.id)
-        let supported: [Double] = [44100, 48000, 88200, 96000, 176400, 192000]
         guard r > 0 else { return }
-        let best = supported.min { abs($0 - r) < abs($1 - r) } ?? 48000
+        let best = PAVNearestSampleRate(r)
         if abs(CA.sampleRate(virt) - best) > 0.5 { CA.set(virt, kAudioDevicePropertyNominalSampleRate, Float64(best)) }
+    }
+
+    /// Tell the driver how much latency sits behind the virtual device, so players keep picture and sound in
+    /// sync as they would on the real device: the real device's own latency plus our buffer. The driver has to
+    /// restart its IO to change it, so this is only sent when the output device or its rate changes.
+    private func syncLatency() {
+        guard let virt = qVirtual, let t = qTarget, !qReleased else { return }
+        let devRate = CA.sampleRate(t.id)
+        guard devRate > 0 else { return }
+        let virtRate = PAVNearestSampleRate(devRate)
+        let out = kAudioObjectPropertyScopeOutput
+        var dev = Double(CA.get(t.id, kAudioDevicePropertyLatency, scope: out, default: UInt32(0)) ?? 0)
+        dev += Double(CA.get(t.id, kAudioDevicePropertySafetyOffset, scope: out, default: UInt32(0)) ?? 0)
+        dev += Double(CA.get(t.id, kAudioDevicePropertyBufferFrameSize, default: UInt32(512)) ?? 512)
+        if let stream = CA.array(t.id, kAudioDevicePropertyStreams, scope: out, of: AudioObjectID.self).first {
+            dev += Double(CA.get(stream, kAudioStreamPropertyLatency, default: UInt32(0)) ?? 0)
+        }
+        // Our buffer: one 512-frame write from the driver plus 3 ms (more while an app uses bigger writes).
+        let frames = Int((dev / devRate * virtRate + 512 + 0.003 * virtRate).rounded())
+        if let l = lastLatency, l.virt == virt, abs(l.frames - frames) < Int(virtRate * 0.002) { return }
+        if CA.setPlist(virt, kPropLatency, NSNumber(value: frames)) == noErr {
+            volLog.log("reported latency -> \(frames) frames")
+            lastLatency = (virt, frames)
+        }
+    }
+
+    /// The engine reads the virtual device's rate when it starts. The rate changes a moment after we ask for
+    /// it, so restart the engine if it started with the old one.
+    private func watchVirtualRate(_ virt: AudioObjectID) {
+        addListener(virt, kAudioDevicePropertyNominalSampleRate) { [weak self] in
+            guard let self, PAVEngineIsRunning(), let v = self.qVirtual,
+                  abs(CA.sampleRate(v) - PAVEngineSourceRate()) > 0.5 else { return }
+            self.restartEngineIfNeeded(force: true)
+        }
     }
 
     private func watchVirtualVolume(_ virt: AudioObjectID) {
@@ -514,7 +627,13 @@ final class Router: ObservableObject {
 
     private func restartEngineIfNeeded(force: Bool) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        guard let virt = qVirtual, let t = qTarget else { return }
+        guard let virt = qVirtual, let t = qTarget, !qReleased else { return }
+        let wasRunning = PAVEngineIsRunning()
+        // macOS 13: a device with inputs and outputs counts as "mic in use" or not depending on whether we
+        // play to it (see MicMonitor), so look again when that changes.
+        defer {
+            if !MicMonitor.hasProcessAPI, PAVEngineIsRunning() != wasRunning { audioQueue.async { [weak self] in self?.mic.refresh() } }
+        }
         if virtualIsRunning() {
             stopWork?.cancel(); stopWork = nil
             if force || !PAVEngineIsRunning() {
@@ -528,7 +647,10 @@ final class Router: ObservableObject {
             let w = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.stopWork = nil
-                if !self.virtualIsRunning() { PAVEngineStop(); self.setPlaying(false); self.publishState(.idle) }
+                if !self.virtualIsRunning() {
+                    PAVEngineStop(); self.setPlaying(false); self.publishState(.idle)
+                    if !MicMonitor.hasProcessAPI { self.mic.refresh() }
+                }
             }
             stopWork = w
             audioQueue.asyncAfter(deadline: .now() + 3, execute: w)
@@ -542,14 +664,22 @@ final class Router: ObservableObject {
     // virtual master volume (what the keyboard keys control), so loudness doesn't jump and 100% in
     // Per-App Volume means the device's real maximum. On quit / switch, the level is handed back.
 
-    private var volumeHandedBack = false
+    /// False while a real device runs at full volume because we took its level over. Starts true: nothing
+    /// has been taken yet, so there is nothing to give back.
+    private var volumeHandedBack = true
+    /// The virtual device we have listeners on.
+    private var watchedVirtual: AudioObjectID?
     /// Last known master level, also used when the virtual device has already disappeared.
     private var cachedMaster: (volume: Float, muted: Bool) = (1, false)
 
     private func refreshCachedMaster() {
-        guard let v = qVirtual else { return }
-        let vol = CA.get(v, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, default: Float32(1)) ?? 1
-        let mute = (CA.get(v, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, default: UInt32(0)) ?? 0) != 0
+        // Only a level we could actually read replaces the cached one: if the device is gone, the cache is
+        // exactly what must be handed back.
+        guard let v = qVirtual,
+              let vol = CA.get(v, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, default: Float32(1))
+        else { return }
+        let mute = CA.get(v, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, default: UInt32(0)).map { $0 != 0 }
+            ?? cachedMaster.muted
         cachedMaster = (vol, mute)
         onMain {
             if abs(self.masterVolume - vol) > 0.001 { self.masterVolume = vol }
@@ -574,12 +704,16 @@ final class Router: ObservableObject {
         refreshCachedMaster()
     }
 
-    private func handBackVolume(to device: AudioDevice) {
-        guard let id = CA.device(uid: device.uid), CA.hardwareVolume(id) != nil else { return }
+    /// Gives the device its level back. False if the device can't be reached right now (try again later).
+    @discardableResult
+    private func handBackVolume(to device: AudioDevice) -> Bool {
+        guard let id = CA.device(uid: device.uid) else { return false }
+        guard CA.hardwareVolume(id) != nil else { return true }   // no volume control: nothing was taken
         refreshCachedMaster()
         volLog.log("handBack \(device.name, privacy: .public) -> \(self.cachedMaster.volume)")
         CA.setHardwareVolume(id, cachedMaster.volume)
         if cachedMaster.muted { CA.setHardwareMute(id, true) }
+        return true
     }
 }
 

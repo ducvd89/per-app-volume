@@ -1,9 +1,11 @@
 import CoreAudio
 import Foundation
 
-let kVirtualDeviceUID = "PerAppVolume_UID"
-let kPropClients: AudioObjectPropertySelector = 0x6170_636C // 'apcl'
-let kPropVolumes: AudioObjectPropertySelector = 0x6170_766C // 'apvl'
+// Shared with the driver: see App/Engine/PAVProtocol.h.
+let kVirtualDeviceUID = kPAVDeviceUID
+let kPropClients: AudioObjectPropertySelector = kPAVPropClients
+let kPropVolumes: AudioObjectPropertySelector = kPAVPropVolumes
+let kPropLatency: AudioObjectPropertySelector = kPAVPropLatency
 
 struct AudioDevice: Identifiable, Hashable {
     let id: AudioObjectID
@@ -26,7 +28,7 @@ enum CA {
         var a = addr(sel, scope)
         var value = def
         var size = UInt32(MemoryLayout<T>.size)
-        let st = AudioObjectGetPropertyData(obj, &a, 0, nil, &size, &value)
+        let st = withUnsafeMutablePointer(to: &value) { AudioObjectGetPropertyData(obj, &a, 0, nil, &size, $0) }
         return st == noErr ? value : nil
     }
 
@@ -35,7 +37,7 @@ enum CA {
                        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, _ value: T) -> OSStatus {
         var a = addr(sel, scope)
         var v = value
-        return AudioObjectSetPropertyData(obj, &a, 0, nil, UInt32(MemoryLayout<T>.size), &v)
+        return withUnsafePointer(to: &v) { AudioObjectSetPropertyData(obj, &a, 0, nil, UInt32(MemoryLayout<T>.size), $0) }
     }
 
     static func has(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> Bool {

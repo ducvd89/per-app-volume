@@ -61,6 +61,9 @@ final class AppStore: ObservableObject {
             guard let pid = (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier else { return }
             audioQueue.async { self?.resolveCache.removeValue(forKey: pid) }
         }
+        // A saved volume applies from the first sample: tell the driver about the new process right away.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in self?.push() }
     }
 
     private func scheduleTimer() {
@@ -147,10 +150,18 @@ final class AppStore: ObservableObject {
             guard let list = CA.plist(virt, kPropClients) as? [[String: Any]] else { return }
 
             var byKey: [String: AudioApp] = [:]
+            var live = Set<pid_t>()
+            var stale = false
             for c in list {
                 guard let pidN = c["pid"] as? NSNumber else { continue }
                 let pid = pid_t(pidN.int32Value)
                 if pid == self.ownPID { continue }
+                live.insert(pid)
+                // The driver says which gain it applies. If that isn't what we sent (coreaudiod restarted and
+                // the driver forgot its table), send the table again.
+                if let g = (c["gain"] as? NSNumber)?.floatValue, let sent = self.lastPushed[String(pid)], abs(g - sent) > 0.001 {
+                    stale = true
+                }
                 let info = self.resolve(pid: pid, bundleID: c["bid"] as? String)
                 let running = (c["run"] as? Bool) ?? false
                 let peak = (c["peak"] as? NSNumber)?.floatValue ?? 0
@@ -162,6 +173,9 @@ final class AppStore: ObservableObject {
                                                peak: peak, isUserApp: info.isUserApp, isGame: info.isGame)
                 }
             }
+            if stale { self.lastPushed = [:] }
+            // Forget processes that are gone, so a reused pid isn't taken for the old app.
+            if self.resolveCache.count > live.count { self.resolveCache = self.resolveCache.filter { live.contains($0.key) } }
             let fresh = Array(byKey.values)
             DispatchQueue.main.async { self.apply(fresh) }
         }
@@ -187,12 +201,28 @@ final class AppStore: ObservableObject {
         push()
     }
 
-    /// Sends the pid → gain table to the driver (only when it changed).
+    /// Sends the gain table to the driver (only when it changed).
     private func push() {
+        func gain(_ key: String) -> Float { muted.contains(key) ? 0 : Float(volume(key)) }
         var table: [String: Float] = [:]
+        // Every process we know, also the ones at 100%: an explicit entry overrides the driver's guess below.
         for a in apps {
-            let g: Float = muted.contains(a.key) ? 0 : Float(volume(a.key))
-            for p in a.pids where g != 1 { table[String(p)] = g }
+            let g = gain(a.key)
+            for p in a.pids { table[String(p)] = g }
+        }
+        // Apps with a saved volume, so they start at that volume instead of 100% until the next poll:
+        // by bundle ID (the driver matches new clients and their helpers against it) and, for apps that are
+        // running but haven't opened the device yet, by pid.
+        let saved = Set(volumes.filter { $0.value != 1 }.keys).union(muted)
+        for key in saved where !key.hasPrefix("/") && !key.hasPrefix("proc:") && key.utf8.count < 120 {
+            table[kPAVBundleGainPrefix + key] = gain(key)
+        }
+        if !saved.isEmpty {
+            for app in NSWorkspace.shared.runningApplications where app.processIdentifier > 0 {
+                guard let key = app.bundleIdentifier ?? app.bundleURL?.path, saved.contains(key) else { continue }
+                let k = String(app.processIdentifier)
+                if table[k] == nil { table[k] = gain(key) }
+            }
         }
         audioQueue.async {
             guard let virt = self.router.virtualID else { return }
