@@ -3,6 +3,7 @@ import Foundation
 import os
 
 private let volLog = Logger(subsystem: "com.perappvolume.app", category: "volume")
+private let routeLog = Logger(subsystem: "com.perappvolume.app", category: "routes")
 
 /// Every Core Audio call goes through this serial queue. coreaudiod can stall (driver install,
 /// macOS bugs); when it does, only this queue waits — the menu bar UI stays responsive.
@@ -54,6 +55,8 @@ final class Router: ObservableObject {
     @Published private(set) var callUsers: [String]?
     /// The default output is currently the real device because of a call.
     @Published private(set) var inCall = false
+    /// The installed driver can send apps to different outputs (drivers before 1.4 can't).
+    @Published private(set) var routingSupported = true
 
     var realDevices: [AudioDevice] { devices.filter { !$0.isVirtualRouter } }
 
@@ -88,6 +91,18 @@ final class Router: ObservableObject {
     /// How long the mic must stay off before the virtual device becomes the default again.
     private let callEndDelay: TimeInterval = 4
 
+    // Per-app outputs (see AppRouting and PAVProtocol.h).
+    /// Driver table key → UID of the device that app should play on ("" = the main output). From AppStore.
+    private var qRouteWants: [String: String] = [:]
+    /// Bus → the device it plays on.
+    private var qBuses: [Int: AudioDevice] = [:]
+    /// Devices a bus couldn't be started on; their apps play on the main output until the device list changes.
+    private var qBusFailed: Set<String> = []
+    private var busRateListeners: [Int: (dev: AudioObjectID, listener: AudioObjectPropertyListenerBlock)] = [:]
+    /// What the driver was last told, so it is only told again when something changes.
+    private var sentRoutes: (virt: AudioObjectID, surfaces: [Int64], table: [String: Int])?
+    private var qRoutingSupported: (virt: AudioObjectID, yes: Bool)?
+
     init() {
         let d = UserDefaults.standard
         let m = OutputMode(rawValue: d.string(forKey: "outputMode") ?? "") ?? .followSystem
@@ -101,7 +116,9 @@ final class Router: ObservableObject {
         callModeEnabled = ce; callAppsOnly = co; callApps = ca
         mic = MicMonitor(config: .init(enabled: ce, onlyListed: co, apps: ca))
         mic.onChange = { [weak self] users in self?.micChanged(users) }
-        mic.isOurOutput = { [weak self] id in self?.qTarget?.id == id && PAVEngineIsRunning() }
+        mic.isOurOutput = { [weak self] id in
+            (self?.qTarget?.id == id && PAVEngineIsRunning()) || (1...kPAVMaxBuses).contains { PAVBusOutput($0) == id }
+        }
     }
 
     private func saveCallConfig() {
@@ -149,6 +166,8 @@ final class Router: ObservableObject {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         volLog.log("coreaudiod restarted: setting up again")
         PAVEngineStop(); setPlaying(false)
+        stopBuses(tellDriver: false)   // the driver is a new instance: it has no routes and no rings
+        qRoutingSupported = nil
         stopWork?.cancel(); stopWork = nil
         for (obj, sel, scope, l) in listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
         listeners.removeAll()
@@ -170,6 +189,7 @@ final class Router: ObservableObject {
         let done = DispatchSemaphore(value: 0)
         audioQueue.async {
             PAVEngineStop()
+            self.stopBuses(tellDriver: true)
             self.mic.stop()
             self.callEndWork?.cancel()
             for (obj, sel, scope, l) in self.listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
@@ -200,6 +220,7 @@ final class Router: ObservableObject {
             self.qReleased = true
             self.stopWork?.cancel(); self.stopWork = nil
             PAVEngineStop(); self.setPlaying(false)
+            self.stopBuses(tellDriver: true)
             self.publishState(.idle)
             if let t = self.qTarget, CA.device(uid: t.uid) != nil {
                 if !self.volumeHandedBack, self.handBackVolume(to: t) { self.volumeHandedBack = true }
@@ -323,8 +344,9 @@ final class Router: ObservableObject {
 
     private func reevaluate(reason: Reason) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        defer { publishDevices(); publishPriority() }
+        defer { syncRoutes(); publishDevices(); publishPriority() }
         qDevices = CA.allOutputDevices()
+        if reason == .devicesChanged || reason == .launch { qBusFailed.removeAll() }
         let historyBefore = qPriority   // MRU history before newly seen devices get appended
         for d in qRealDevices where qDeviceNames[d.uid] != d.name { qDeviceNames[d.uid] = d.name }
         for d in qRealDevices where !qPriority.contains(d.uid) { qPriority.append(d.uid) }
@@ -433,6 +455,11 @@ final class Router: ObservableObject {
         // Apps play straight to a real device (call): it keeps its own volume instead of running at full volume.
         let direct = (wantDefault ?? CA.defaultOutput) != virt
         if changed, let old = qTarget, !volumeHandedBack { handBackVolume(to: old); volumeHandedBack = true }
+        // A bus plays at its device's own volume, the main mix on a device at full volume. So between the
+        // old device getting its level back (above) and the new one going to full volume (below): apps that
+        // had the new device as their own output join the main mix and that bus stops, and apps whose
+        // output is the old device get a bus there.
+        if changed { syncRoutes(main: device) }
         qTarget = device
         watchEars(device)
         if direct {
@@ -467,6 +494,132 @@ final class Router: ObservableObject {
         if qCallState == .none, CA.defaultSystemOutput != virt { CA.setDefaultSystemOutput(virt) }
         publishCall()
         restartEngineIfNeeded(force: changed || !PAVEngineIsRunning())
+        syncRoutes()
+    }
+
+    // MARK: Per-app outputs (audioQueue)
+    // An app with an output of its own is taken out of the main mix by the driver and mixed into a "bus":
+    // a second ring, which a second engine plays on that device. Buses don't go through the master volume
+    // (that one stands for the main device's volume, see "Volume hand-off"); their device keeps its own.
+
+    /// Where every app should play: driver table key ("<pid>" or "b:<bundle id>") → device UID ("" = the
+    /// main output). Only on `audioQueue`.
+    func setRouteWants(_ wants: [String: String]) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard wants != qRouteWants || sentRoutes == nil else { return }
+        qRouteWants = wants
+        syncRoutes()
+    }
+
+    /// The bus the driver was last given for a table key. Only on `audioQueue`.
+    func sentBus(_ key: String) -> Int? {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        return sentRoutes?.table[key]
+    }
+
+    /// The driver doesn't have what it was sent (it restarted): send it again. Only on `audioQueue`.
+    func resendRoutes() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        sentRoutes = nil
+        syncRoutes()
+    }
+
+    private func routingSupported(_ virt: AudioObjectID) -> Bool {
+        if let s = qRoutingSupported, s.virt == virt { return s.yes }
+        let yes = CA.has(virt, kPropRoutes)
+        qRoutingSupported = (virt, yes)
+        if !yes { routeLog.log("the installed driver has no per-app outputs") }
+        onMain { if self.routingSupported != yes { self.routingSupported = yes } }
+        return yes
+    }
+
+    /// Works out which app plays on which bus, tells the driver, and starts and stops the buses.
+    /// `main`: the main output, when it is about to change.
+    private func syncRoutes(main: AudioDevice? = nil) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard let virt = qVirtual, !qReleased, routingSupported(virt) else { stopBuses(tellDriver: false); return }
+        let devices = Dictionary(qRealDevices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
+        let plan = AppRouting.plan(wants: qRouteWants, connected: Set(devices.keys).subtracting(qBusFailed),
+                                   main: (main ?? qTarget)?.uid, current: qBuses.mapValues(\.uid), maxBuses: Int(kPAVMaxBuses))
+        var buses: [Int: AudioDevice] = [:]
+        var surfaces = [Int64](repeating: 0, count: Int(kPAVMaxBuses))
+        for (bus, uid) in plan.buses {
+            guard let dev = devices[uid] else { continue }
+            let id = PAVBusSurfaceID(Int32(bus))
+            guard id != 0 else { continue }   // no ring: the driver keeps those apps in the main mix
+            buses[bus] = dev
+            surfaces[bus - 1] = id
+        }
+        // The driver first, the engines after: apps leaving a bus are in the main mix before that bus stops.
+        if sentRoutes == nil || sentRoutes!.virt != virt || sentRoutes!.surfaces != surfaces || sentRoutes!.table != plan.table {
+            let st = CA.setPlist(virt, kPropRoutes, Self.routesPlist(surfaces: surfaces, table: plan.table))
+            if st == noErr {
+                sentRoutes = (virt, surfaces, plan.table)
+                let names = buses.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value.name)" }.joined(separator: ", ")
+                routeLog.log("outputs -> \(names.isEmpty ? "main only" : names, privacy: .public)")
+            } else {
+                routeLog.error("couldn't send the routes to the driver (\(st))")
+            }
+        }
+        qBuses = buses
+        syncBusEngines()
+    }
+
+    private static func routesPlist(surfaces: [Int64], table: [String: Int]) -> NSDictionary {
+        [kPAVRoutesKeySurfaces: surfaces.map { NSNumber(value: $0) },
+         kPAVRoutesKeyRoutes: table.mapValues { NSNumber(value: $0) }] as NSDictionary
+    }
+
+    /// Buses play while the virtual device is in use, like the main output does.
+    private func syncBusEngines() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        let run = qVirtual != nil && !qReleased && (virtualIsRunning() || PAVEngineIsRunning())
+        var changed = false
+        for bus in 1...Int(kPAVMaxBuses) {
+            let b = Int32(bus)
+            let dev = run ? qBuses[bus] : nil
+            if let l = busRateListeners[bus], l.dev != dev?.id {
+                CA.unlisten(l.dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l.listener)
+                busRateListeners[bus] = nil
+            }
+            guard let dev, let virt = qVirtual else {
+                if PAVBusIsRunning(b) { PAVBusStop(b); changed = true }
+                continue
+            }
+            if busRateListeners[bus] == nil {
+                let l = CA.listen(dev.id, kAudioDevicePropertyNominalSampleRate, queue: audioQueue) { [weak self] in
+                    PAVBusStop(b)             // it reads the device's rate when it starts
+                    self?.syncBusEngines()
+                }
+                busRateListeners[bus] = (dev.id, l)
+            }
+            // Also restarted when the virtual device changed its rate (it follows the main output's).
+            guard !PAVBusIsRunning(b) || PAVBusOutput(b) != dev.id || abs(PAVBusSourceRate(b) - CA.sampleRate(virt)) > 0.5 else { continue }
+            let st = PAVBusStart(b, virt, dev.id)
+            changed = true
+            if st == noErr {
+                routeLog.log("bus \(bus) playing on \(dev.name, privacy: .public)")
+            } else {
+                // Its apps would be silent: treat the device as not connected, so they play on the main output.
+                routeLog.error("couldn't open \(dev.name, privacy: .public) for bus \(bus) (\(st))")
+                qBusFailed.insert(dev.uid)
+                audioQueue.async { [weak self] in self?.syncRoutes() }
+            }
+        }
+        if changed, !MicMonitor.hasProcessAPI { audioQueue.async { [weak self] in self?.mic.refresh() } }
+    }
+
+    /// Stops every bus. `tellDriver`: also put every app back in the main mix (when we stop playing the
+    /// buses but the driver stays).
+    private func stopBuses(tellDriver: Bool) {
+        for bus in 1...Int(kPAVMaxBuses) { PAVBusStop(Int32(bus)) }
+        for (_, l) in busRateListeners { CA.unlisten(l.dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l.listener) }
+        busRateListeners.removeAll()
+        qBuses.removeAll()
+        if tellDriver, sentRoutes != nil, let virt = qVirtual {
+            CA.setPlist(virt, kPropRoutes, Self.routesPlist(surfaces: [Int64](repeating: 0, count: Int(kPAVMaxBuses)), table: [:]))
+        }
+        sentRoutes = nil
     }
 
     // MARK: AirPods ear detection (audioQueue)
@@ -601,9 +754,9 @@ final class Router: ObservableObject {
     /// it, so restart the engine if it started with the old one.
     private func watchVirtualRate(_ virt: AudioObjectID) {
         addListener(virt, kAudioDevicePropertyNominalSampleRate) { [weak self] in
-            guard let self, PAVEngineIsRunning(), let v = self.qVirtual,
-                  abs(CA.sampleRate(v) - PAVEngineSourceRate()) > 0.5 else { return }
-            self.restartEngineIfNeeded(force: true)
+            guard let self, let v = self.qVirtual else { return }
+            if PAVEngineIsRunning(), abs(CA.sampleRate(v) - PAVEngineSourceRate()) > 0.5 { self.restartEngineIfNeeded(force: true) }
+            self.syncBusEngines()
         }
     }
 
@@ -627,6 +780,7 @@ final class Router: ObservableObject {
 
     private func restartEngineIfNeeded(force: Bool) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
+        defer { syncBusEngines() }
         guard let virt = qVirtual, let t = qTarget, !qReleased else { return }
         let wasRunning = PAVEngineIsRunning()
         // macOS 13: a device with inputs and outputs counts as "mic in use" or not depending on whether we
@@ -649,6 +803,7 @@ final class Router: ObservableObject {
                 self.stopWork = nil
                 if !self.virtualIsRunning() {
                     PAVEngineStop(); self.setPlaying(false); self.publishState(.idle)
+                    self.syncBusEngines()
                     if !MicMonitor.hasProcessAPI { self.mic.refresh() }
                 }
             }

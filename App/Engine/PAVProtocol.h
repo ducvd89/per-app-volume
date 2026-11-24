@@ -18,9 +18,21 @@
 #define kPAVPropAudio    0x61706164u   // 'apad'  get      new mixed frames (polling fallback)
 #define kPAVPropSurface  0x61707366u   // 'apsf'  get/set  shared ring
 #define kPAVPropLatency  0x61706C74u   // 'aplt'  get/set  frames of latency the device reports
+#define kPAVPropRoutes   0x61707274u   // 'aprt'  get/set  per-app outputs (added in 1.4)
 
 // Keys of the 'apvl' dictionary are either "<pid>" or this prefix followed by a bundle ID.
 #define kPAVBundleGainPrefix "b:"
+
+// Per-app outputs. Apps normally end up in the main mix, which the app plays on the main output device.
+// An app can be sent to a "bus" instead (1...kPAVMaxBuses): the driver mixes the apps of a bus into a
+// shared ring of their own (same layout as the main one, see PAVShared.h) and the app plays each ring on
+// another device. 'aprt' is a dictionary with two optional entries:
+//   "surfaces": array of kPAVMaxBuses IOSurface IDs, the ring of bus 1, 2, … (0 = none)
+//   "routes":   dictionary { "<pid>" | "b:<bundle id>" : bus }, looked up like the gain table; 0 = main mix
+// A client whose bus has no ring stays in the main mix.
+#define kPAVMaxBuses          4
+#define kPAVRoutesKeySurfaces "surfaces"
+#define kPAVRoutesKeyRoutes   "routes"
 
 // Sample rates the virtual device can run at. The low ones are what Bluetooth headsets use while
 // their microphone is on.

@@ -6,6 +6,7 @@ let kVirtualDeviceUID = kPAVDeviceUID
 let kPropClients: AudioObjectPropertySelector = kPAVPropClients
 let kPropVolumes: AudioObjectPropertySelector = kPAVPropVolumes
 let kPropLatency: AudioObjectPropertySelector = kPAVPropLatency
+let kPropRoutes: AudioObjectPropertySelector = kPAVPropRoutes
 
 struct AudioDevice: Identifiable, Hashable {
     let id: AudioObjectID

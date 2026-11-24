@@ -49,7 +49,7 @@ struct PopoverView: View {
             }
             MasterRow(router: router)
             if router.inCall, let t = router.target {
-                Label("In a call\(router.callUsers.map { " (\($0.joined(separator: ", ")))" } ?? ""): playing straight to \(t.name). Per-app volumes are paused.",
+                Label("In a call\(router.callUsers.map { " (\($0.joined(separator: ", ")))" } ?? ""): playing straight to \(t.name). Per-app volumes and outputs are paused.",
                       systemImage: "phone.fill")
                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -72,7 +72,7 @@ struct PopoverView: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(list) { app in AppRow(store: store, app: app) }
+                    ForEach(list) { app in AppRow(store: store, router: router, app: app) }
                 }
                 .padding(.horizontal, 6).padding(.vertical, 6)
             }
@@ -148,11 +148,14 @@ struct MasterRow: View {
 
 struct AppRow: View {
     @ObservedObject var store: AppStore
+    @ObservedObject var router: Router
     let app: AudioApp
     @StateObject private var hover = Box(false)
 
     private var selected: Bool { store.selection.contains(app.key) }
     private var muted: Bool { store.isMuted(app.key) }
+    /// The apps this row's controls act on: the whole selection when the row is part of it.
+    private var targets: [String] { selected && store.selection.count > 1 ? Array(store.selection) : [app.key] }
 
     var body: some View {
         let vol = store.volume(app.key)
@@ -164,6 +167,7 @@ struct AppRow: View {
                     Text(app.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     if store.isPinned(app.key) { Image(systemName: "pin.fill").font(.system(size: 8)).foregroundStyle(.orange) }
                     if app.playing { Image(systemName: "waveform").font(.system(size: 8)).foregroundStyle(.green) }
+                    if let uid = store.output(app.key) { OutputTag(router: router, uid: uid) }
                     Spacer(minLength: 4)
                     Text("\(Int((vol * 100).rounded()))%")
                         .font(.system(size: 10).monospacedDigit())
@@ -172,13 +176,20 @@ struct AppRow: View {
                 Slider(value: Binding(get: { vol }, set: { newV in
                     var v = newV
                     if abs(v - 1) < 0.04 { v = 1 }        // detent at 100 %
-                    let keys = selected && store.selection.count > 1 ? Array(store.selection) : [app.key]
-                    store.setVolume(v, for: keys)
+                    store.setVolume(v, for: targets)
                 }), in: 0...2)
                 .controlSize(.mini)
                 .disabled(muted)
                 MeterBar(level: muted ? 0 : app.peak)
             }
+            Menu {
+                OutputMenuItems(store: store, router: router, keys: targets, current: store.output(app.key))
+            } label: {
+                Image(systemName: store.output(app.key) == nil ? "hifispeaker" : "hifispeaker.fill").frame(width: 18)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .disabled(!router.routingSupported)
+            .help(router.routingSupported ? "Output device for this app" : "Update the driver to choose an output device for each app")
             Button { store.toggleMute(app.key) } label: {
                 Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .foregroundStyle(muted ? Color.red : Color.primary)
@@ -205,9 +216,58 @@ struct AppRow: View {
             Button(store.isPinned(app.key) ? "Unpin" : "Pin to Top") { store.setPinned(!store.isPinned(app.key), for: [app.key]) }
             Button(muted ? "Unmute" : "Mute") { store.toggleMute(app.key) }
             Button("Reset to 100%") { store.setVolume(1, for: [app.key]) }
+            Menu("Output") {
+                OutputMenuItems(store: store, router: router, keys: targets, current: store.output(app.key))
+            }
+            .disabled(!router.routingSupported)
             Divider()
             Button(store.isHidden(app.key) ? "Unhide" : "Hide This App") { store.setHidden(!store.isHidden(app.key), for: [app.key]) }
         }
+    }
+}
+
+/// The choices of the per-app output menu: the main output, or one device for this app.
+struct OutputMenuItems: View {
+    @ObservedObject var store: AppStore
+    @ObservedObject var router: Router
+    let keys: [String]
+    /// The saved choice of the app the menu was opened on.
+    let current: String?
+
+    var body: some View {
+        Button { store.setOutput(nil, for: keys) } label: {
+            item("Main Output" + (router.target.map { " (\($0.name))" } ?? ""), checked: current == nil)
+        }
+        Divider()
+        ForEach(router.realDevices) { d in
+            Button { store.setOutput(d.uid, for: keys) } label: { item(d.name, checked: current == d.uid) }
+        }
+        // The saved device, while it isn't connected: the app plays on the main output until it is back.
+        if let c = current, !router.realDevices.contains(where: { $0.uid == c }) {
+            Button {} label: { item("\(router.deviceNames[c] ?? "Unknown device") (not connected)", checked: true) }
+                .disabled(true)
+        }
+    }
+
+    @ViewBuilder private func item(_ title: String, checked: Bool) -> some View {
+        if checked { Label(title, systemImage: "checkmark") } else { Text(title) }
+    }
+}
+
+/// Next to an app's name: the output device chosen for it.
+struct OutputTag: View {
+    @ObservedObject var router: Router
+    let uid: String
+
+    var body: some View {
+        let connected = router.realDevices.contains { $0.uid == uid }
+        let name = router.deviceNames[uid] ?? "Unknown device"
+        Text("→ \(name)")
+            .font(.system(size: 10)).lineLimit(1).truncationMode(.tail)
+            .foregroundStyle(connected ? .secondary : .tertiary)
+            .strikethrough(!connected)
+            .help(connected ? "Plays on \(name)"
+                            : "\(name) isn't connected: playing on \(router.target?.name ?? "the main output") until it is")
     }
 }
 

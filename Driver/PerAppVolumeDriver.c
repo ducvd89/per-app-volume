@@ -7,6 +7,8 @@
 //   * coreaudiod hands each client's audio to us BEFORE it is mixed
 //     (kAudioServerPlugInIOOperationProcessOutput). We apply the per-app gain there.
 //   * The final mix (WriteMix) goes into a ring buffer.
+//   * Apps the user gave an output device of their own are taken out of that mix: their audio goes into
+//     a ring per output ("bus") instead, see the 'aprt' property and PAVProtocol.h.
 //   * The companion app pulls the mix through a custom device *property* ('apad')
 //     and plays it on the real output device. No input stream is ever opened,
 //     so macOS never shows the microphone / recording indicator.
@@ -17,8 +19,9 @@
 //   'apad'  get  CFData (interleaved stereo Float32)           new mixed frames
 //   'apsf'  get/set CFNumber                                    shared ring (see PAVShared.h)
 //   'aplt'  get/set CFNumber                                    frames of latency to report
+//   'aprt'  get/set CFDictionary{surfaces, routes}              per-app outputs (see PAVProtocol.h)
 //
-//  The properties that carry audio or change behaviour ('apad', 'apsf', 'aplt', setting 'apvl')
+//  The properties that carry audio or change behaviour ('apad', 'apsf', 'aplt', setting 'apvl' or 'aprt')
 //  only answer the companion app: see CallerMayControl().
 //
 
@@ -33,6 +36,7 @@
 #include <string.h>
 #include <strings.h>
 #include <os/log.h>
+#include <os/lock.h>
 #include <IOSurface/IOSurface.h>
 #include "PAVShared.h"
 #include "PAVProtocol.h"
@@ -72,7 +76,7 @@ enum {
 
 #define kSampleRates    kPAVSampleRates
 #define kNumSampleRates ((UInt32)kPAVNumSampleRates)
-#define kNumCustomProps 5
+#define kNumCustomProps 6
 
 #pragma mark - State
 
@@ -112,12 +116,27 @@ static _Atomic uint64_t   gWriteEnd = 0;
 static PAVSharedRing* _Atomic gShm = NULL;
 static IOSurfaceRef   gShmSurface = NULL;
 static IOSurfaceID    gShmID = 0;
-static IOSurfaceRef   gShmGraveyard[8];
+#define kShmGraveyardSize 16
+static IOSurfaceRef   gShmGraveyard[kShmGraveyardSize];
 static int            gShmGraveyardN = 0;
 static pthread_mutex_t gShmMutex = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint32_t   gStreamGen = 0;
 static uint64_t           gReadPos = 0;       // under gReadMutex
 static uint32_t           gReadGen = 0xFFFFFFFF;
+
+// Extra outputs. Each bus has a shared ring like the main one, holding the mix of the clients routed to it.
+// Clients write from their own IO cycles, which can differ in size and position and may run on different
+// threads, so the ring is filled the way the host fills its own mix buffer: frames nobody has written yet
+// are zeroed once (up to `clearedEnd`), then every client adds its audio at its sample time.
+typedef struct {
+    PAVSharedRing* _Atomic ring;   // NULL: no ring; clients routed here stay in the main mix
+    IOSurfaceRef   surface;        // under gShmMutex
+    IOSurfaceID    surfaceID;      // under gShmMutex
+    PAVSharedRing* clearedRing;    // under gBusLock: the ring `clearedEnd` is about
+    uint64_t       clearedEnd;     // under gBusLock: frames below this are zeroed or hold audio
+} PAVBus;
+static PAVBus         gBuses[kPAVMaxBuses + 1];   // [0] is not used: bus 0 is the main mix
+static os_unfair_lock gBusLock = OS_UNFAIR_LOCK_INIT;
 
 typedef struct {
     _Atomic bool    used;
@@ -127,21 +146,27 @@ typedef struct {
     char            bundleIDC[kBundleIDMax];   // same, as a C string ("" if none)
     _Atomic float   gain;       // target gain
     float           applied;    // IO thread only (ramping)
+    _Atomic int     bus;        // where its audio should go (0 = main mix)
+    int             busApplied; // IO thread only: where it went in the last cycle
     _Atomic float   peak;
     _Atomic bool    running;
 } PAVClient;
 
 static PAVClient gClients[kMaxClients];
 
-typedef struct { pid_t pid; float gain; } PAVPidGain;
-static PAVPidGain gPidGains[kMaxPidGains];    // under gClientMutex
-static int        gPidGainCount = 0;
-
-// Gains by bundle ID, for clients the app hasn't seen yet (an app that was just launched): they start at
-// their saved volume instead of 100%. The app corrects the guess with the client's pid on its next poll.
-typedef struct { char bundleID[kBundleIDMax]; float gain; } PAVBundleGain;
-static PAVBundleGain gBundleGains[kMaxBundleGains];   // under gClientMutex
-static int           gBundleGainCount = 0;
+// A per-app setting as the app sends it: by pid, and by bundle ID for clients the app hasn't seen yet (an
+// app that was just launched), so those start with their saved setting instead of the default. The app
+// corrects the guess with the client's pid on its next poll.
+typedef struct { pid_t pid; float value; } PAVPidEntry;
+typedef struct { char bundleID[kBundleIDMax]; float value; } PAVBundleEntry;
+typedef struct {
+    PAVPidEntry    pids[kMaxPidGains];
+    int            pidCount;
+    PAVBundleEntry bundles[kMaxBundleGains];
+    int            bundleCount;
+} PAVTable;
+static PAVTable gGains;     // under gClientMutex: volume (default 1)
+static PAVTable gRoutes;    // under gClientMutex: bus (default 0)
 
 #pragma mark - Prototypes
 
@@ -227,21 +252,23 @@ static void NotifyAsync(AudioObjectID obj, AudioObjectPropertySelector sel, Audi
     });
 }
 
-/// Gain for a client: its pid if the app listed it, else the longest bundle-ID entry that is the client's
-/// bundle ID or a parent of it ("com.x.app" also covers "com.x.app.helper"), else 1.
-static float LookupGainLocked(pid_t pid, const char* bundleID) {
-    for (int i = 0; i < gPidGainCount; ++i) if (gPidGains[i].pid == pid) return gPidGains[i].gain;
-    float gain = 1.0f;
+/// A client's setting: its pid if the app listed it, else the longest bundle-ID entry that is the client's
+/// bundle ID or a parent of it ("com.x.app" also covers "com.x.app.helper"), else `def`.
+static float LookupLocked(const PAVTable* t, pid_t pid, const char* bundleID, float def) {
+    for (int i = 0; i < t->pidCount; ++i) if (t->pids[i].pid == pid) return t->pids[i].value;
+    float value = def;
     size_t bestLen = 0;
-    if (bundleID == NULL || bundleID[0] == 0) return gain;
-    for (int i = 0; i < gBundleGainCount; ++i) {
-        const char* e = gBundleGains[i].bundleID;
+    if (bundleID == NULL || bundleID[0] == 0) return value;
+    for (int i = 0; i < t->bundleCount; ++i) {
+        const char* e = t->bundles[i].bundleID;
         size_t n = strlen(e);
         if (n <= bestLen || strncasecmp(bundleID, e, n) != 0) continue;
-        if (bundleID[n] == 0 || bundleID[n] == '.') { bestLen = n; gain = gBundleGains[i].gain; }
+        if (bundleID[n] == 0 || bundleID[n] == '.') { bestLen = n; value = t->bundles[i].value; }
     }
-    return gain;
+    return value;
 }
+static float LookupGainLocked(pid_t pid, const char* bundleID) { return LookupLocked(&gGains, pid, bundleID, 1.0f); }
+static int   LookupBusLocked(pid_t pid, const char* bundleID)  { return (int)LookupLocked(&gRoutes, pid, bundleID, 0.0f); }
 
 /// Whether the process asking is allowed to read the mix or change how the device behaves.
 /// Every caller is registered as a client (with the bundle ID coreaudiod saw) before its first property
@@ -267,6 +294,22 @@ static PAVClient* FindClient(UInt32 clientID) {
         if (atomic_load_explicit(&c->used, memory_order_acquire) && c->clientID == clientID) return c;
     }
     return NULL;
+}
+
+static inline void ApplyRampedGain(float* buf, UInt32 frames, float from, float to) {
+    if (from == to) {
+        if (to == 1.0f) return;
+        UInt32 n = frames * kChannels;
+        for (UInt32 i = 0; i < n; ++i) buf[i] *= to;
+        return;
+    }
+    float step = (to - from) / (float)(frames ? frames : 1);
+    float g = from;
+    for (UInt32 f = 0; f < frames; ++f) {
+        g += step;
+        buf[f * 2]     *= g;
+        buf[f * 2 + 1] *= g;
+    }
 }
 
 #pragma mark - Factory
@@ -360,6 +403,9 @@ static OSStatus PAV_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioOb
             float g = LookupGainLocked(ci->mProcessID, c->bundleIDC);
             atomic_store(&c->gain, g);
             c->applied = g;
+            int bus = LookupBusLocked(ci->mProcessID, c->bundleIDC);
+            atomic_store(&c->bus, bus);
+            c->busApplied = bus;
             atomic_store(&c->peak, 0.0f);
             atomic_store(&c->running, false);
             atomic_store_explicit(&c->used, true, memory_order_release);
@@ -475,6 +521,7 @@ static Boolean PAV_HasProperty_Impl(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioDevicePropertyIsHidden: case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyStreams: case kAudioObjectPropertyCustomPropertyInfoList:
         case kPAVPropClients: case kPAVPropVolumes: case kPAVPropAudio: case kPAVPropSurface: case kPAVPropLatency:
+        case kPAVPropRoutes:
         case kAudioDevicePropertyClockIsStable: case kAudioDevicePropertyClockAlgorithm:
             return true;
         // Answered on every scope (like Apple's NullAudio sample); coreaudiod drops the device if these fail.
@@ -523,7 +570,7 @@ static OSStatus PAV_IsPropertySettable_Impl(AudioServerPlugInDriverRef inDriver,
     switch (obj) {
     case kObjectID_Device:
         *out = (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kPAVPropVolumes ||
-                a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency);
+                a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency || a->mSelector == kPAVPropRoutes);
         break;
     case kObjectID_Stream:
         *out = (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat ||
@@ -585,6 +632,7 @@ static OSStatus PAV_GetPropertyDataSize_Impl(AudioServerPlugInDriverRef inDriver
             *out = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + kChannels * sizeof(AudioChannelDescription)); return 0;
         case kAudioObjectPropertyCustomPropertyInfoList: *out = kNumCustomProps * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         case kPAVPropClients: case kPAVPropVolumes: case kPAVPropAudio: case kPAVPropSurface: case kPAVPropLatency:
+        case kPAVPropRoutes:
             *out = sizeof(CFPropertyListRef); return 0;
         }
         break;
@@ -640,6 +688,10 @@ static CFPropertyListRef CopyClientList(void) {
         SInt32 cid = (SInt32)c->clientID, p = (SInt32)c->pid;
         float peak = atomic_exchange(&c->peak, 0.0f);
         float gain = atomic_load(&c->gain);
+        SInt32 bus = (SInt32)atomic_load(&c->bus);
+        CFNumberRef nbus = CFNumberCreate(NULL, kCFNumberSInt32Type, &bus);
+        CFDictionarySetValue(d, CFSTR("bus"), nbus);
+        CFRelease(nbus);
         CFNumberRef ncid = CFNumberCreate(NULL, kCFNumberSInt32Type, &cid);
         CFNumberRef npid = CFNumberCreate(NULL, kCFNumberSInt32Type, &p);
         CFNumberRef npk  = CFNumberCreate(NULL, kCFNumberFloat32Type, &peak);
@@ -658,59 +710,72 @@ static CFPropertyListRef CopyClientList(void) {
     return arr;
 }
 
-static CFPropertyListRef CopyVolumeTable(void) {
+/// A table as the dictionary the app sent: { "<pid>" | "b:<bundle id>" : value }.
+static CFMutableDictionaryRef CopyTableLocked(const PAVTable* t) {
     CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    pthread_mutex_lock(&gClientMutex);
-    for (int i = 0; i < gPidGainCount; ++i) {
-        CFStringRef k = CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), (int)gPidGains[i].pid);
-        CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &gPidGains[i].gain);
+    for (int i = 0; i < t->pidCount; ++i) {
+        CFStringRef k = CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), (int)t->pids[i].pid);
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &t->pids[i].value);
         CFDictionarySetValue(d, k, n);
         CFRelease(k); CFRelease(n);
     }
-    for (int i = 0; i < gBundleGainCount; ++i) {
-        CFStringRef k = CFStringCreateWithFormat(NULL, NULL, CFSTR(kPAVBundleGainPrefix "%s"), gBundleGains[i].bundleID);
-        CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &gBundleGains[i].gain);
+    for (int i = 0; i < t->bundleCount; ++i) {
+        CFStringRef k = CFStringCreateWithFormat(NULL, NULL, CFSTR(kPAVBundleGainPrefix "%s"), t->bundles[i].bundleID);
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &t->bundles[i].value);
         if (k) { CFDictionarySetValue(d, k, n); CFRelease(k); }
         CFRelease(n);
     }
+    return d;
+}
+
+static CFPropertyListRef CopyVolumeTable(void) {
+    pthread_mutex_lock(&gClientMutex);
+    CFMutableDictionaryRef d = CopyTableLocked(&gGains);
     pthread_mutex_unlock(&gClientMutex);
     return d;
 }
 
-typedef struct { int pids; int bundles; } VolCtx;
-static void VolApplier(const void* key, const void* value, void* ctx) {
-    VolCtx* vc = (VolCtx*)ctx;
+typedef struct { PAVTable* table; float min, max; bool whole; } TableCtx;
+static void TableApplier(const void* key, const void* value, void* ctx) {
+    TableCtx* tc = (TableCtx*)ctx;
+    PAVTable* t = tc->table;
     if (CFGetTypeID(key) != CFStringGetTypeID() || CFGetTypeID(value) != CFNumberGetTypeID()) return;
-    Float32 g = 1.0f;
-    CFNumberGetValue((CFNumberRef)value, kCFNumberFloat32Type, &g);
-    if (!(g >= 0.0f)) g = 0.0f;
-    if (g > 4.0f) g = 4.0f;
+    Float32 v = tc->min;
+    CFNumberGetValue((CFNumberRef)value, kCFNumberFloat32Type, &v);
+    if (!(v >= tc->min)) v = tc->min;
+    if (v > tc->max) v = tc->max;
+    if (tc->whole) v = floorf(v);
     if (CFStringHasPrefix((CFStringRef)key, CFSTR(kPAVBundleGainPrefix))) {
-        if (vc->bundles >= kMaxBundleGains) return;
+        if (t->bundleCount >= kMaxBundleGains) return;
         char buf[kBundleIDMax + sizeof(kPAVBundleGainPrefix)];
         if (!CFStringGetCString((CFStringRef)key, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
         const char* bid = buf + sizeof(kPAVBundleGainPrefix) - 1;
         if (bid[0] == 0 || strlen(bid) >= kBundleIDMax) return;
-        strlcpy(gBundleGains[vc->bundles].bundleID, bid, kBundleIDMax);
-        gBundleGains[vc->bundles].gain = g;
-        vc->bundles++;
+        strlcpy(t->bundles[t->bundleCount].bundleID, bid, kBundleIDMax);
+        t->bundles[t->bundleCount].value = v;
+        t->bundleCount++;
         return;
     }
-    if (vc->pids >= kMaxPidGains) return;
+    if (t->pidCount >= kMaxPidGains) return;
     SInt32 p = CFStringGetIntValue((CFStringRef)key);
     if (p <= 0) return;
-    gPidGains[vc->pids].pid = (pid_t)p;
-    gPidGains[vc->pids].gain = g;
-    vc->pids++;
+    t->pids[t->pidCount].pid = (pid_t)p;
+    t->pids[t->pidCount].value = v;
+    t->pidCount++;
+}
+
+/// Replaces a table with the dictionary's contents. Call with gClientMutex held.
+static void FillTableLocked(PAVTable* t, CFDictionaryRef dict, float min, float max, bool whole) {
+    TableCtx ctx = { t, min, max, whole };
+    t->pidCount = 0;
+    t->bundleCount = 0;
+    CFDictionaryApplyFunction(dict, TableApplier, &ctx);
 }
 
 static void SetVolumeTable(CFPropertyListRef plist) {
     if (plist == NULL || CFGetTypeID(plist) != CFDictionaryGetTypeID()) return;
     pthread_mutex_lock(&gClientMutex);
-    VolCtx ctx = { 0, 0 };
-    CFDictionaryApplyFunction((CFDictionaryRef)plist, VolApplier, &ctx);
-    gPidGainCount = ctx.pids;
-    gBundleGainCount = ctx.bundles;
+    FillTableLocked(&gGains, (CFDictionaryRef)plist, 0.0f, 4.0f, false);
     for (int i = 0; i < kMaxClients; ++i) {
         PAVClient* c = &gClients[i];
         if (atomic_load(&c->used)) atomic_store(&c->gain, LookupGainLocked(c->pid, c->bundleIDC));
@@ -720,6 +785,39 @@ static void SetVolumeTable(CFPropertyListRef plist) {
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"   // IOSurfaceLookup: still the way to share by ID
+/// Maps the ring the app created (its IOSurface ID) and marks it attached. `*outSurf` stays locked.
+static OSStatus OpenSharedRing(SInt64 id, IOSurfaceRef* outSurf, PAVSharedRing** outRing) {
+    IOSurfaceRef surf = IOSurfaceLookup((IOSurfaceID)id);
+    if (surf == NULL) { os_log_error(gLog, "PAV shm lookup %lld failed", id); return kAudioHardwareIllegalOperationError; }
+    if (IOSurfaceGetAllocSize(surf) < PAV_SHM_BYTES) { CFRelease(surf); return kAudioHardwareBadPropertySizeError; }
+    IOSurfaceLock(surf, 0, NULL);   // CPU-only memory: base address stays valid; keep it locked while attached
+    PAVSharedRing* ring = (PAVSharedRing*)IOSurfaceGetBaseAddress(surf);
+    if (ring->magic != PAV_SHM_MAGIC || ring->version != PAV_SHM_VERSION || ring->capacityFrames != PAV_SHM_FRAMES) {
+        IOSurfaceUnlock(surf, 0, NULL); CFRelease(surf);
+        return kAudioHardwareIllegalOperationError;
+    }
+    atomic_store(&ring->writeEnd, atomic_load(&gWriteEnd));
+    atomic_store(&ring->chunkFrames, 0);
+    atomic_store(&ring->features, PAV_SHM_FEATURE_CHUNK);
+    atomic_fetch_add(&ring->generation, 1);
+    atomic_store(&ring->attached, 1);
+    *outSurf = surf; *outRing = ring;
+    return 0;
+}
+#pragma clang diagnostic pop
+
+/// A surface that was just replaced. The IO thread may still hold its pointer for one cycle, so it is
+/// released a few swaps later. Call with gShmMutex held.
+static void RetireSurfaceLocked(IOSurfaceRef old) {
+    if (old == NULL) return;
+    if (gShmGraveyardN == kShmGraveyardSize) {
+        IOSurfaceUnlock(gShmGraveyard[0], 0, NULL); CFRelease(gShmGraveyard[0]);
+        memmove(gShmGraveyard, gShmGraveyard + 1, (kShmGraveyardSize - 1) * sizeof(IOSurfaceRef));
+        gShmGraveyardN = kShmGraveyardSize - 1;
+    }
+    gShmGraveyard[gShmGraveyardN++] = old;
+}
+
 static OSStatus AttachSharedRing(CFPropertyListRef v) {
     SInt64 id = 0;
     if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID() || !CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &id))
@@ -727,37 +825,167 @@ static OSStatus AttachSharedRing(CFPropertyListRef v) {
     IOSurfaceRef surf = NULL;
     PAVSharedRing* ring = NULL;
     if (id != 0) {
-        surf = IOSurfaceLookup((IOSurfaceID)id);
-        if (surf == NULL) { os_log_error(gLog, "PAV shm lookup %lld failed", id); return kAudioHardwareIllegalOperationError; }
-        if (IOSurfaceGetAllocSize(surf) < PAV_SHM_BYTES) { CFRelease(surf); return kAudioHardwareBadPropertySizeError; }
-        IOSurfaceLock(surf, 0, NULL);   // CPU-only memory: base address stays valid; keep it locked while attached
-        ring = (PAVSharedRing*)IOSurfaceGetBaseAddress(surf);
-        if (ring->magic != PAV_SHM_MAGIC || ring->version != PAV_SHM_VERSION || ring->capacityFrames != PAV_SHM_FRAMES) {
-            IOSurfaceUnlock(surf, 0, NULL); CFRelease(surf);
-            return kAudioHardwareIllegalOperationError;
-        }
-        atomic_store(&ring->writeEnd, atomic_load(&gWriteEnd));
-        atomic_store(&ring->chunkFrames, 0);
-        atomic_store(&ring->features, PAV_SHM_FEATURE_CHUNK);
-        atomic_fetch_add(&ring->generation, 1);
-        atomic_store(&ring->attached, 1);
+        OSStatus st = OpenSharedRing(id, &surf, &ring);
+        if (st != 0) return st;
     }
     pthread_mutex_lock(&gShmMutex);
     IOSurfaceRef old = gShmSurface;
     gShmSurface = surf;
     gShmID = surf ? (IOSurfaceID)id : 0;
     atomic_store_explicit(&gShm, ring, memory_order_release);
-    if (old) {
-        // The IO thread may still hold the old pointer for one cycle; release it a few swaps later.
-        if (gShmGraveyardN == 8) { IOSurfaceUnlock(gShmGraveyard[0], 0, NULL); CFRelease(gShmGraveyard[0]);
-            memmove(gShmGraveyard, gShmGraveyard + 1, 7 * sizeof(IOSurfaceRef)); gShmGraveyardN = 7; }
-        gShmGraveyard[gShmGraveyardN++] = old;
-    }
+    RetireSurfaceLocked(old);
     pthread_mutex_unlock(&gShmMutex);
     os_log(gLog, "PAV shm attached id=%lld", id);
     return 0;
 }
-#pragma clang diagnostic pop
+
+#pragma mark - Per-app outputs
+
+/// Gives bus `b` the ring with this surface ID (0: none). The same ring again changes nothing.
+static OSStatus AttachBusRing(int b, SInt64 id) {
+    PAVBus* bus = &gBuses[b];
+    pthread_mutex_lock(&gShmMutex);
+    bool same = bus->surfaceID == (IOSurfaceID)id;
+    pthread_mutex_unlock(&gShmMutex);
+    if (same) return 0;
+    IOSurfaceRef surf = NULL;
+    PAVSharedRing* ring = NULL;
+    OSStatus st = id != 0 ? OpenSharedRing(id, &surf, &ring) : 0;
+    pthread_mutex_lock(&gShmMutex);
+    IOSurfaceRef old = bus->surface;
+    bus->surface = surf;
+    bus->surfaceID = surf ? (IOSurfaceID)id : 0;
+    atomic_store_explicit(&bus->ring, ring, memory_order_release);
+    RetireSurfaceLocked(old);
+    pthread_mutex_unlock(&gShmMutex);
+    os_log(gLog, "PAV bus %d ring id=%lld (%d)", b, id, (int)st);
+    return st;
+}
+
+static OSStatus SetRoutes(CFPropertyListRef plist) {
+    if (plist == NULL || CFGetTypeID(plist) != CFDictionaryGetTypeID()) return kAudioHardwareIllegalOperationError;
+    OSStatus result = 0;
+    CFTypeRef surfaces = CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR(kPAVRoutesKeySurfaces));
+    if (surfaces && CFGetTypeID(surfaces) == CFArrayGetTypeID()) {
+        for (int b = 1; b <= kPAVMaxBuses; ++b) {
+            SInt64 id = 0;
+            if (b - 1 < CFArrayGetCount((CFArrayRef)surfaces)) {
+                CFTypeRef n = CFArrayGetValueAtIndex((CFArrayRef)surfaces, b - 1);
+                if (n && CFGetTypeID(n) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)n, kCFNumberSInt64Type, &id);
+            }
+            OSStatus st = AttachBusRing(b, id);
+            if (st != 0 && result == 0) result = st;
+        }
+    }
+    CFTypeRef routes = CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR(kPAVRoutesKeyRoutes));
+    if (routes && CFGetTypeID(routes) == CFDictionaryGetTypeID()) {
+        pthread_mutex_lock(&gClientMutex);
+        FillTableLocked(&gRoutes, (CFDictionaryRef)routes, 0.0f, (float)kPAVMaxBuses, true);
+        for (int i = 0; i < kMaxClients; ++i) {
+            PAVClient* c = &gClients[i];
+            if (atomic_load(&c->used)) atomic_store(&c->bus, LookupBusLocked(c->pid, c->bundleIDC));
+        }
+        pthread_mutex_unlock(&gClientMutex);
+    }
+    return result;
+}
+
+/// The route table and which buses have a ring. Never the surface IDs: they would let any process map the audio.
+static CFPropertyListRef CopyRoutes(void) {
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    pthread_mutex_lock(&gClientMutex);
+    CFMutableDictionaryRef routes = CopyTableLocked(&gRoutes);
+    pthread_mutex_unlock(&gClientMutex);
+    CFDictionarySetValue(d, CFSTR(kPAVRoutesKeyRoutes), routes);
+    CFRelease(routes);
+    CFMutableArrayRef attached = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    pthread_mutex_lock(&gShmMutex);
+    for (int b = 1; b <= kPAVMaxBuses; ++b) CFArrayAppendValue(attached, gBuses[b].surfaceID != 0 ? kCFBooleanTrue : kCFBooleanFalse);
+    pthread_mutex_unlock(&gShmMutex);
+    CFDictionarySetValue(d, CFSTR(kPAVRoutesKeySurfaces), attached);
+    CFRelease(attached);
+    return d;
+}
+
+static void RingZero(PAVSharedRing* ring, uint64_t from, uint64_t end) {
+    if (end <= from) return;
+    uint64_t n = end - from;
+    if (n >= PAV_SHM_FRAMES) { memset(ring->data, 0, sizeof(ring->data)); return; }
+    uint32_t start = (uint32_t)(from & PAV_SHM_MASK);
+    uint32_t first = (uint32_t)n;
+    if (start + first > PAV_SHM_FRAMES) first = PAV_SHM_FRAMES - start;
+    memset(&ring->data[start * 2], 0, first * kBytesPerFrame);
+    if (first < n) memset(&ring->data[0], 0, (size_t)(n - first) * kBytesPerFrame);
+}
+
+/// Makes every frame below `end` either silence or audio that was already mixed in, so that [st, end) can
+/// be added to. Call with gBusLock held.
+static void BusClearToLocked(PAVBus* bus, PAVSharedRing* ring, uint64_t st, uint64_t end) {
+    uint64_t from = bus->clearedEnd;
+    // Another ring, or the sample time jumped (IO restarted, or it ran far ahead): start over at `st`.
+    if (ring != bus->clearedRing || from > end + PAV_SHM_FRAMES / 2 || from + PAV_SHM_FRAMES / 2 < st) {
+        bus->clearedRing = ring;
+        from = st;
+    } else if (from >= end) {
+        return;
+    }
+    RingZero(ring, from, end);
+    bus->clearedEnd = end;
+}
+
+/// Adds one client's audio, times a gain going from `g0` to `g1`, to a bus at its sample time.
+/// False (nothing done) if the bus has no ring.
+static bool BusAdd(int b, const float* buf, UInt32 frames, uint64_t st, float g0, float g1) {
+    PAVBus* bus = &gBuses[b];
+    PAVSharedRing* ring = atomic_load_explicit(&bus->ring, memory_order_acquire);
+    if (ring == NULL || frames > kMaxChunkFrames) return false;
+    float step = (g1 - g0) / (float)frames;
+    float g = g0;
+    os_unfair_lock_lock(&gBusLock);
+    BusClearToLocked(bus, ring, st, st + frames);
+    for (UInt32 f = 0; f < frames; ++f) {
+        g += step;
+        uint32_t i = (uint32_t)((st + f) & PAV_SHM_MASK);
+        ring->data[i * 2]     += buf[f * 2] * g;
+        ring->data[i * 2 + 1] += buf[f * 2 + 1] * g;
+    }
+    os_unfair_lock_unlock(&gBusLock);
+    return true;
+}
+
+/// Sends a client's audio (its gain already applied) where it belongs. What is left in `buf` afterwards
+/// is its share of the main mix. A change of output is cross-faded over one cycle.
+static void RouteClient(PAVClient* c, float* buf, UInt32 frames, uint64_t st) {
+    int to = atomic_load_explicit(&c->bus, memory_order_relaxed);
+    if (to < 0 || to > kPAVMaxBuses || (to != 0 && atomic_load_explicit(&gBuses[to].ring, memory_order_acquire) == NULL)) to = 0;
+    int from = c->busApplied;
+    if (to == from) {
+        if (to != 0 && BusAdd(to, buf, frames, st, 1.0f, 1.0f)) memset(buf, 0, frames * kBytesPerFrame);
+        return;
+    }
+    if (from != 0) BusAdd(from, buf, frames, st, 1.0f, 0.0f);
+    if (to != 0)   BusAdd(to, buf, frames, st, 0.0f, 1.0f);
+    if (from == 0)    ApplyRampedGain(buf, frames, 1.0f, 0.0f);
+    else if (to == 0) ApplyRampedGain(buf, frames, 0.0f, 1.0f);
+    else              memset(buf, 0, frames * kBytesPerFrame);
+    c->busApplied = to;
+}
+
+/// The device's timeline reached `st + frames`: every bus ring is readable up to there, like the main one.
+static void PublishBuses(UInt32 frames, uint64_t st) {
+    uint64_t end = st + frames;
+    for (int b = 1; b <= kPAVMaxBuses; ++b) {
+        PAVBus* bus = &gBuses[b];
+        PAVSharedRing* ring = atomic_load_explicit(&bus->ring, memory_order_acquire);
+        if (ring == NULL) continue;
+        os_unfair_lock_lock(&gBusLock);
+        BusClearToLocked(bus, ring, st, end);
+        os_unfair_lock_unlock(&gBusLock);
+        atomic_store_explicit(&ring->chunkFrames, frames, memory_order_relaxed);
+        uint64_t pe = atomic_load_explicit(&ring->writeEnd, memory_order_relaxed);
+        if (end > pe || st + PAV_SHM_FRAMES < pe) atomic_store_explicit(&ring->writeEnd, end, memory_order_release);
+    }
+}
 
 static CFPropertyListRef CopyAudioChunk(void) {
     pthread_mutex_lock(&gReadMutex);
@@ -899,6 +1127,7 @@ static OSStatus PAV_GetPropertyData_Impl(AudioServerPlugInDriverRef inDriver, Au
                 { kPAVPropAudio,   kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 { kPAVPropSurface, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 { kPAVPropLatency, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                { kPAVPropRoutes,  kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
             };
             UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo); if (n > kNumCustomProps) n = kNumCustomProps;
             memcpy(out, info, n * sizeof(AudioServerPlugInCustomPropertyInfo));
@@ -921,6 +1150,7 @@ static OSStatus PAV_GetPropertyData_Impl(AudioServerPlugInDriverRef inDriver, Au
             *outSize = sizeof(CFPropertyListRef);
             return 0;
         }
+        case kPAVPropRoutes: NEED(sizeof(CFPropertyListRef)); *(CFPropertyListRef*)out = CopyRoutes(); *outSize = sizeof(CFPropertyListRef); return 0;
         case kPAVPropLatency: {
             NEED(sizeof(CFPropertyListRef));
             pthread_mutex_lock(&gStateMutex); SInt64 l = gLatencyFrames; pthread_mutex_unlock(&gStateMutex);
@@ -1048,12 +1278,14 @@ static OSStatus PAV_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
             if (inSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
             return RequestRateChange(*(const Float64*)in);
         }
-        if (a->mSelector == kPAVPropVolumes || a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency) {
+        if (a->mSelector == kPAVPropVolumes || a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency ||
+            a->mSelector == kPAVPropRoutes) {
             if (inSize < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
             if (!CallerMayControl(pid)) return kAudioHardwareIllegalOperationError;
             CFPropertyListRef v = *(const CFPropertyListRef*)in;
             if (a->mSelector == kPAVPropVolumes) { SetVolumeTable(v); return 0; }
             if (a->mSelector == kPAVPropSurface) return AttachSharedRing(v);
+            if (a->mSelector == kPAVPropRoutes) return SetRoutes(v);
             return RequestLatencyChange(v);
         }
         break;
@@ -1100,6 +1332,14 @@ static OSStatus PAV_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID i
         atomic_fetch_add(&gStreamGen, 1);
         PAVSharedRing* ring = atomic_load_explicit(&gShm, memory_order_acquire);
         if (ring) { atomic_store_explicit(&ring->writeEnd, 0, memory_order_release); atomic_fetch_add(&ring->generation, 1); }
+        for (int b = 1; b <= kPAVMaxBuses; ++b) {
+            PAVSharedRing* br = atomic_load_explicit(&gBuses[b].ring, memory_order_acquire);
+            os_unfair_lock_lock(&gBusLock);
+            gBuses[b].clearedEnd = 0;
+            gBuses[b].clearedRing = NULL;
+            os_unfair_lock_unlock(&gBusLock);
+            if (br) { atomic_store_explicit(&br->writeEnd, 0, memory_order_release); atomic_fetch_add(&br->generation, 1); }
+        }
     }
     gIORunningCount++;
     pthread_mutex_unlock(&gClockMutex);
@@ -1186,22 +1426,6 @@ static OSStatus PAV_BeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioO
     return 0;
 }
 
-static inline void ApplyRampedGain(float* buf, UInt32 frames, float from, float to) {
-    if (from == to) {
-        if (to == 1.0f) return;
-        UInt32 n = frames * kChannels;
-        for (UInt32 i = 0; i < n; ++i) buf[i] *= to;
-        return;
-    }
-    float step = (to - from) / (float)(frames ? frames : 1);
-    float g = from;
-    for (UInt32 f = 0; f < frames; ++f) {
-        g += step;
-        buf[f * 2]     *= g;
-        buf[f * 2 + 1] *= g;
-    }
-}
-
 static OSStatus PAV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, AudioObjectID inStream, UInt32 clientID,
                                   UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo* ci, void* mainBuf, void* secBuf) {
     (void)inStream; (void)secBuf;
@@ -1220,6 +1444,7 @@ static OSStatus PAV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
             for (UInt32 i = 0; i < n; ++i) { float v = fabsf(buf[i]); if (v > pk) pk = v; }
             float old = atomic_load_explicit(&c->peak, memory_order_relaxed);
             if (pk > old) atomic_store_explicit(&c->peak, pk, memory_order_relaxed);
+            RouteClient(c, buf, frames, (uint64_t)ci->mOutputTime.mSampleTime);
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
         float target = atomic_load_explicit(&gMuted, memory_order_relaxed) ? 0.0f : atomic_load_explicit(&gMasterGain, memory_order_relaxed);
@@ -1255,6 +1480,7 @@ static OSStatus PAV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
             atomic_store_explicit(&ring->chunkFrames, frames, memory_order_relaxed);
             if (end > pe || st + PAV_SHM_FRAMES < pe) atomic_store_explicit(&ring->writeEnd, end, memory_order_release);
         }
+        PublishBuses(frames, st);
     }
     return 0;
 }

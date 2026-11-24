@@ -3,7 +3,7 @@ import CoreAudio
 import Darwin
 
 struct AudioApp: Identifiable, Equatable {
-    let key: String            // bundle id (or app path / "proc:<name>")
+    let key: String            // bundle id (or app path / "wine:<program>" / "proc:<name>")
     var name: String
     var icon: NSImage
     var pids: Set<pid_t>
@@ -29,6 +29,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var muted: Set<String>
     @Published private(set) var pinned: Set<String>
     @Published private(set) var hidden: Set<String>
+    /// App key → UID of the output device the app plays on. Apps without an entry play on the main output;
+    /// so does an app whose device isn't connected (the entry stays, for when it comes back).
+    @Published private(set) var outputs: [String: String]
 
     let router: Router
     private var timer: Timer?
@@ -52,9 +55,12 @@ final class AppStore: ObservableObject {
         muted = Set(d.stringArray(forKey: "appMuted") ?? [])
         pinned = Set(d.stringArray(forKey: "appPinned") ?? [])
         hidden = Set(d.stringArray(forKey: "appHidden") ?? [])
-        // Apps whose volume was ever adjusted have obviously played before.
+        let outs = (d.dictionary(forKey: "appOutputs") as? [String: String]) ?? [:]
+        outputs = outs
+        // Apps whose volume or output was ever set have obviously played before.
         let vols = (d.dictionary(forKey: "appVolumes") as? [String: Double]) ?? [:]
         everPlayed = Set(d.stringArray(forKey: "appEverPlayed") ?? []).union(vols.keys).union(d.stringArray(forKey: "appMuted") ?? [])
+            .union(outs.keys)
         scheduleTimer()
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification,
                                                           object: nil, queue: .main) { [weak self] n in
@@ -78,6 +84,15 @@ final class AppStore: ObservableObject {
     func isMuted(_ key: String) -> Bool { muted.contains(key) }
     func isPinned(_ key: String) -> Bool { pinned.contains(key) }
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
+    /// UID of the output device chosen for this app (nil: the main output).
+    func output(_ key: String) -> String? { outputs[key] }
+
+    /// What an app's settings are saved under, and its name: the bundle ID, else the app's path, else
+    /// (Windows programs run by Wine, which have neither) the program's name.
+    static func identity(of app: NSRunningApplication) -> (key: String, name: String)? {
+        if let key = app.bundleIdentifier ?? app.bundleURL?.path { return (key, app.localizedName ?? key) }
+        return WineApp.identity(pid: app.processIdentifier)
+    }
 
     /// The list: running apps (with windows) that have ever played audio, plus pinned apps.
     /// Background/system processes are never listed (their saved volume still applies).
@@ -86,10 +101,10 @@ final class AppStore: ObservableObject {
         // Apps that played before but have closed their audio connection for now (e.g. a paused browser tab).
         var seen = Set(out.map(\.key))
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
-            guard let key = app.bundleIdentifier ?? app.bundleURL?.path, !seen.contains(key),
-                  everPlayed.contains(key) || pinned.contains(key), app.processIdentifier != ownPID else { continue }
+            guard app.processIdentifier != ownPID, let (key, name) = Self.identity(of: app), !seen.contains(key),
+                  everPlayed.contains(key) || pinned.contains(key) else { continue }
             seen.insert(key)
-            out.append(AudioApp(key: key, name: app.localizedName ?? key, icon: app.icon ?? NSImage(), pids: [],
+            out.append(AudioApp(key: key, name: name, icon: app.icon ?? NSImage(), pids: [],
                                 playing: false, peak: 0, isUserApp: true, isGame: false))
         }
         return out
@@ -121,6 +136,12 @@ final class AppStore: ObservableObject {
         for k in keys { if p { pinned.insert(k) } else { pinned.remove(k) } }
         persist()
     }
+    /// Play these apps on the device with this UID (nil: on the main output).
+    func setOutput(_ uid: String?, for keys: [String]) {
+        for k in keys { outputs[k] = uid }
+        if uid != nil { everPlayed.formUnion(keys) }   // stays listed, like an app with a volume of its own
+        persist(); push()
+    }
     func setHidden(_ h: Bool, for keys: [String]) {
         for k in keys { if h { hidden.insert(k) } else { hidden.remove(k) } }
         selection.subtract(keys)
@@ -133,6 +154,7 @@ final class AppStore: ObservableObject {
         d.set(Array(muted), forKey: "appMuted")
         d.set(Array(pinned), forKey: "appPinned")
         d.set(Array(hidden), forKey: "appHidden")
+        d.set(outputs, forKey: "appOutputs")
     }
 
     // MARK: Driver sync
@@ -151,7 +173,7 @@ final class AppStore: ObservableObject {
 
             var byKey: [String: AudioApp] = [:]
             var live = Set<pid_t>()
-            var stale = false
+            var stale = false, staleRoutes = false
             for c in list {
                 guard let pidN = c["pid"] as? NSNumber else { continue }
                 let pid = pid_t(pidN.int32Value)
@@ -161,6 +183,9 @@ final class AppStore: ObservableObject {
                 // the driver forgot its table), send the table again.
                 if let g = (c["gain"] as? NSNumber)?.floatValue, let sent = self.lastPushed[String(pid)], abs(g - sent) > 0.001 {
                     stale = true
+                }
+                if let b = (c["bus"] as? NSNumber)?.intValue, let sent = self.router.sentBus(String(pid)), b != sent {
+                    staleRoutes = true
                 }
                 let info = self.resolve(pid: pid, bundleID: c["bid"] as? String)
                 let running = (c["run"] as? Bool) ?? false
@@ -174,6 +199,7 @@ final class AppStore: ObservableObject {
                 }
             }
             if stale { self.lastPushed = [:] }
+            if staleRoutes { self.router.resendRoutes() }
             // Forget processes that are gone, so a reused pid isn't taken for the old app.
             if self.resolveCache.count > live.count { self.resolveCache = self.resolveCache.filter { live.contains($0.key) } }
             let fresh = Array(byKey.values)
@@ -201,30 +227,38 @@ final class AppStore: ObservableObject {
         push()
     }
 
-    /// Sends the gain table to the driver (only when it changed).
+    /// Sends the gain table to the driver (only when it changed), and tells the router where each app plays.
     private func push() {
         func gain(_ key: String) -> Float { muted.contains(key) ? 0 : Float(volume(key)) }
         var table: [String: Float] = [:]
-        // Every process we know, also the ones at 100%: an explicit entry overrides the driver's guess below.
+        var wants: [String: String] = [:]      // same keys → output device UID ("" = the main output)
+        // Every process we know, also the ones at 100% on the main output: an explicit entry overrides the
+        // driver's guess below.
+        let routing = !outputs.isEmpty         // nothing to tell the driver while every app is on the main output
         for a in apps {
-            let g = gain(a.key)
-            for p in a.pids { table[String(p)] = g }
+            let g = gain(a.key), out = outputs[a.key] ?? ""
+            for p in a.pids { table[String(p)] = g; if routing { wants[String(p)] = out } }
         }
-        // Apps with a saved volume, so they start at that volume instead of 100% until the next poll:
-        // by bundle ID (the driver matches new clients and their helpers against it) and, for apps that are
-        // running but haven't opened the device yet, by pid.
+        // Apps with a saved volume or output, so they start with it instead of at 100% on the main output
+        // until the next poll: by bundle ID (the driver matches new clients and their helpers against it)
+        // and, for apps that are running but haven't opened the device yet, by pid.
         let saved = Set(volumes.filter { $0.value != 1 }.keys).union(muted)
-        for key in saved where !key.hasPrefix("/") && !key.hasPrefix("proc:") && key.utf8.count < 120 {
+        for key in saved where AppRouting.isBundleID(key) && key.utf8.count < 120 {
             table[kPAVBundleGainPrefix + key] = gain(key)
         }
-        if !saved.isEmpty {
+        for (key, uid) in outputs where AppRouting.isBundleID(key) && key.utf8.count < 120 {
+            wants[kPAVBundleGainPrefix + key] = uid
+        }
+        if !saved.isEmpty || !outputs.isEmpty {
             for app in NSWorkspace.shared.runningApplications where app.processIdentifier > 0 {
-                guard let key = app.bundleIdentifier ?? app.bundleURL?.path, saved.contains(key) else { continue }
+                guard let key = Self.identity(of: app)?.key else { continue }
                 let k = String(app.processIdentifier)
-                if table[k] == nil { table[k] = gain(key) }
+                if saved.contains(key), table[k] == nil { table[k] = gain(key) }
+                if let uid = outputs[key], wants[k] == nil { wants[k] = uid }
             }
         }
         audioQueue.async {
+            self.router.setRouteWants(wants)
             guard let virt = self.router.virtualID else { return }
             if table == self.lastPushed && self.lastPushedDevice == virt { return }
             let dict = NSMutableDictionary()
@@ -270,7 +304,13 @@ final class AppStore: ObservableObject {
                 if regular { break }
             }
         }
-        // 2. Outermost .app bundle in the executable path (e.g. helpers of apps launched oddly)
+        // 2. A Windows program run by Wine: it has no bundle of its own, and the bundle its executable is in
+        //    (if any) is Wine's, shared by every program. Known by the program's name instead.
+        if result == nil || result?.isUserApp == false, let wine = WineApp.identity(pid: pid) {
+            result = Resolved(key: wine.key, name: wine.name, icon: NSRunningApplication(processIdentifier: pid)?.icon ?? genericIcon(),
+                              isUserApp: true, isGame: false)
+        }
+        // 3. Outermost .app bundle in the executable path (e.g. helpers of apps launched oddly)
         if result == nil || result?.isUserApp == false, let path = processPath(pid), let r = path.range(of: ".app/") {
             let appPath = String(path[..<r.lowerBound]) + ".app"
             let url = URL(fileURLWithPath: appPath)
@@ -287,7 +327,7 @@ final class AppStore: ObservableObject {
                                   isUserApp: runningRegular, isGame: Self.isGame(bundleURL: url))
             }
         }
-        // 3. Bundle id reported by Core Audio, or the process name (system services: never listed)
+        // 4. Bundle id reported by Core Audio, or the process name (system services: never listed)
         if result == nil {
             let name = processPath(pid).map { URL(fileURLWithPath: $0).lastPathComponent } ?? bundleID ?? "PID \(pid)"
             result = Resolved(key: bundleID ?? "proc:\(name)", name: name, icon: genericIcon(), isUserApp: false, isGame: false)
@@ -308,9 +348,5 @@ final class AppStore: ObservableObject {
         return info.kp_eproc.e_ppid
     }
 
-    private func processPath(_ pid: pid_t) -> String? {
-        var buf = [CChar](repeating: 0, count: 4096)
-        let n = proc_pidpath(pid, &buf, UInt32(buf.count))
-        return n > 0 ? String(cString: buf) : nil
-    }
+    private func processPath(_ pid: pid_t) -> String? { WineApp.executablePath(pid) }
 }

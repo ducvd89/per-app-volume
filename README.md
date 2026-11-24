@@ -43,6 +43,8 @@ Quitting the app sends audio back to your real device.
 
 - 0 to 200% and mute for each app.
 - Volumes are remembered by bundle ID and applied from the first sound an app makes when it comes back.
+- Windows programs run by Wine (CrossOver, Whisky, Game Porting Toolkit…) have no bundle ID. When no Mac app
+  stands for them, they are remembered by the name of their `.exe`.
 - Helper processes are grouped under their app: Chrome Helper under Chrome, WebKit under Safari, game launchers
   under the game.
 - The master volume follows the keyboard volume keys and shows the macOS HUD. 100% is the real maximum of your
@@ -60,6 +62,12 @@ Quitting the app sends audio back to your real device.
   output. When it disconnects, the output falls back to the most recently connected device that is still there.
   Devices that stay connected keep their order.
 - Or set your own priority order in Settings, and the first connected device in it is always used.
+- An output device for each app: the speaker button on an app's row sends that app to a device of its own,
+  while everything else stays on the main output. Up to four devices besides the main one can play at once.
+- The choice is remembered for each app. While its device isn't connected, the app plays on the main output,
+  and it moves back by itself when the device returns.
+- An app on a device of its own plays at that device's own volume. The master volume and the volume keys
+  belong to the main output.
 - Sample rates from 8 kHz to 192 kHz are matched to the real device automatically, including the low rates
   Bluetooth headsets switch to while their microphone is on. Any other rate is converted.
 - AirPods ear detection: taking AirPods out of your ears pauses playback and putting them back in resumes it.
@@ -76,8 +84,8 @@ Quitting the app sends audio back to your real device.
 Echo cancellation and voice processing need the real output device, so calls bypass Per-App Volume.
 
 While a calling app uses the microphone, the macOS default output becomes your real speakers or headphones. A
-few seconds after the microphone stops, the output goes back to Per-App Volume. Per-app volumes don't apply to
-anything during the call.
+few seconds after the microphone stops, the output goes back to Per-App Volume. Per-app volumes and per-app
+outputs don't apply to anything during the call.
 
 - Plugging or unplugging headphones during a call still switches the output. If you pick another output
   yourself, it is left alone.
@@ -104,6 +112,10 @@ Apps (Spotify, Safari, games…) ──► "Per-App Volume" virtual output devic
 - **The driver** is an AudioServerPlugIn. coreaudiod hands it each client's audio before mixing, so it applies
   the per-app gain in `ProcessOutput`, then writes the mix into a ring buffer it shares with the app through an
   IOSurface. There is no IPC per audio chunk and no polling thread.
+- **An output for each app.** The driver takes the apps you gave a device of their own out of the mix and
+  mixes them into a second ring for each device. The app plays every ring on its device with another output
+  IOProc. The virtual device's clock can follow only one real device, the main one, so on the others the app
+  makes up for clock drift by stretching or shortening a buffer by one frame now and then.
 - **The app** opens only an output IOProc on the real device. Because it never opens an input stream and never
   uses ScreenCaptureKit or process taps, macOS doesn't treat it as recording.
 - **Bit-perfect at 100%.** The virtual device's clock is locked to the real device's clock. The app publishes
@@ -165,7 +177,7 @@ Both restart coreaudiod, which interrupts audio for a moment.
 ```
 
 Runs the engine against a simulated driver, the driver's entry points against a stand-in host, and the app's
-switching rules. Nothing is installed and no audio device is touched.
+switching and per-app output rules. Nothing is installed and no audio device is touched.
 
 ## Project layout
 
@@ -178,8 +190,9 @@ switching rules. Nothing is installed and no audio device is touched.
 | `App/Sources/` | The SwiftUI menu bar app |
 | `App/Sources/Router.swift` | Chooses the output device, hands the volume over, starts and stops the engine |
 | `App/Sources/DeviceSwitching.swift` | The output switching rules |
+| `App/Sources/AppRouting.swift` | Which app plays on which output, and how Wine programs are told apart |
 | `App/Sources/CallMode.swift` | Notices calling apps using the microphone (HAL properties only) |
-| `App/Sources/AppStore.swift` | The app list and the per-app gains sent to the driver |
+| `App/Sources/AppStore.swift` | The app list and the per-app gains and outputs sent to the driver |
 | `App/Sources/DriverInstaller.swift` | Installs, updates and removes the driver from the app |
 | `tests/` | The tests, run by `scripts/test.sh` |
 
@@ -188,6 +201,9 @@ switching rules. Nothing is installed and no audio device is touched.
 - **Force-quit leaves the device at full volume.** While Per-App Volume forwards audio, the real device runs at
   full volume and the app applies your level. If the app is force-quit or crashes, it can't put the device's own
   level back, and nothing plays until it runs again. Open it again before playing straight to that device.
+- **Picture and sound on a second output.** The virtual device reports the latency of the main output. An app
+  playing video on another device with a very different latency (Bluetooth next to wired) can be slightly out
+  of sync.
 - **coreaudiod at 100% CPU after many driver installs.** Every coreaudiod restart (installing or removing a
   driver) makes the macOS AirPlay helper register its drivers twice as often. After many restarts coreaudiod can
   get stuck at 100% CPU. This is a macOS bug, and a reboot clears it.

@@ -124,13 +124,16 @@ static void TestAccess(void) {
     CFDictionaryRef t = Table(1, keys, gains);
     CHECK(SetPlist(kOtherPID, kPAVPropVolumes, t) != 0, "another process could change volumes");
     CFRelease(t);
-    pthread_mutex_lock(&gClientMutex); int n = gPidGainCount; pthread_mutex_unlock(&gClientMutex);
-    CHECK(n != 1 || gPidGains[0].pid != 4242, "the refused table was applied anyway");
+    pthread_mutex_lock(&gClientMutex); int n = gGains.pidCount; pthread_mutex_unlock(&gClientMutex);
+    CHECK(n != 1 || gGains.pids[0].pid != 4242, "the refused table was applied anyway");
 
     CFNumberRef id = Num64(12345);
     CHECK(SetPlist(kOtherPID, kPAVPropSurface, id) != 0, "another process could replace the shared ring");
     CHECK(SetPlist(kOtherPID, kPAVPropLatency, id) != 0, "another process could change the latency");
     CFRelease(id);
+    CFDictionaryRef routes = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CHECK(SetPlist(kOtherPID, kPAVPropRoutes, routes) != 0, "another process could change where apps play");
+    CFRelease(routes);
 
     // The client list stays readable (the app's own UI needs nothing more than that from others).
     CHECK(GetPlist(kOtherPID, kPAVPropClients, &out) == 0 && out != NULL, "client list");
@@ -139,8 +142,8 @@ static void TestAccess(void) {
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-static void TestSharedRing(void) {
-    printf("shared ring: attaches for the app, reports its write size, never gives the surface ID away\n");
+/// A ring as the app creates it. NULL where IOSurfaces can't be made.
+static PAVSharedRing* MakeRing(SInt64* outID) {
     int bytes = (int)PAV_SHM_BYTES;
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &bytes);
     CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -148,13 +151,21 @@ static void TestSharedRing(void) {
     CFDictionarySetValue(d, kIOSurfaceIsGlobal, kCFBooleanTrue);
     IOSurfaceRef surf = IOSurfaceCreate(d);
     CFRelease(d); CFRelease(n);
-    if (!surf) { printf("  (skipped: no IOSurface here)\n"); return; }
+    if (!surf) return NULL;
     IOSurfaceLock(surf, 0, NULL);
     PAVSharedRing* ring = (PAVSharedRing*)IOSurfaceGetBaseAddress(surf);
     memset(ring, 0, PAV_SHM_BYTES);
     ring->magic = PAV_SHM_MAGIC; ring->version = PAV_SHM_VERSION; ring->capacityFrames = PAV_SHM_FRAMES; ring->channels = PAV_SHM_CHANNELS;
+    *outID = IOSurfaceGetID(surf);
+    return ring;
+}
 
-    SInt64 sid = IOSurfaceGetID(surf);
+static void TestSharedRing(void) {
+    printf("shared ring: attaches for the app, reports its write size, never gives the surface ID away\n");
+    SInt64 sid = 0;
+    PAVSharedRing* ring = MakeRing(&sid);
+    if (!ring) { printf("  (skipped: no IOSurface here)\n"); return; }
+
     CFNumberRef idn = Num64(sid);
     CHECK(SetPlist(kOtherPID, kPAVPropSurface, idn) != 0 && atomic_load(&ring->attached) == 0, "attached for another process");
     CHECK(SetPlist(kAppPID, kPAVPropSurface, idn) == 0, "attach refused for the app");
@@ -183,6 +194,151 @@ static void TestSharedRing(void) {
     CHECK(SetPlist(kAppPID, kPAVPropSurface, zero) == 0, "detach");
     CFRelease(zero);
     // The driver keeps the old surface for a while (its IO thread may still be writing); leave ours alone too.
+}
+
+// ---- per-app outputs ----
+
+/// Sends 'aprt': the rings of the buses (0 = none; NULL = leave them) and the route table.
+static OSStatus SetRoutesFor(pid_t pid, const SInt64* surfaces, int n, const char* keys[], const float buses[]) {
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (surfaces) {
+        CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+        for (int i = 0; i < kPAVMaxBuses; ++i) { CFNumberRef v = Num64(surfaces[i]); CFArrayAppendValue(arr, v); CFRelease(v); }
+        CFDictionarySetValue(d, CFSTR(kPAVRoutesKeySurfaces), arr); CFRelease(arr);
+    }
+    CFDictionaryRef t = Table(n, keys, buses);
+    CFDictionarySetValue(d, CFSTR(kPAVRoutesKeyRoutes), t); CFRelease(t);
+    OSStatus st = SetPlist(pid, kPAVPropRoutes, d);
+    CFRelease(d);
+    return st;
+}
+
+/// One client's part of an IO cycle: `frames` of the constant `value` at sample time `st`. Returns what is
+/// left of it for the main mix (first and last sample).
+typedef struct { float first, last; } Left;
+static Left ClientCycle(UInt32 clientID, uint64_t st, UInt32 frames, float value) {
+    static float buf[4096 * 2];
+    for (UInt32 i = 0; i < frames * 2; ++i) buf[i] = value;
+    AudioServerPlugInIOCycleInfo ci = { 0 }; ci.mOutputTime.mSampleTime = (Float64)st;
+    PAV_DoIOOperation(gDriverRef, kObjectID_Device, kObjectID_Stream, clientID, kAudioServerPlugInIOOperationProcessOutput, frames, &ci, buf, NULL);
+    return (Left){ buf[0], buf[frames * 2 - 1] };
+}
+/// The end of a cycle: the host hands over the mix of what the clients left.
+static void MixCycle(uint64_t st, UInt32 frames, float value) {
+    static float buf[4096 * 2];
+    for (UInt32 i = 0; i < frames * 2; ++i) buf[i] = value;
+    AudioServerPlugInIOCycleInfo ci = { 0 }; ci.mOutputTime.mSampleTime = (Float64)st;
+    PAV_DoIOOperation(gDriverRef, kObjectID_Device, kObjectID_Stream, 1, kAudioServerPlugInIOOperationWriteMix, frames, &ci, buf, NULL);
+}
+/// Whether every sample of [from, end) in the ring is `value`.
+static bool RingIs(const PAVSharedRing* ring, uint64_t from, uint64_t end, float value) {
+    for (uint64_t t = from; t < end; ++t) {
+        uint32_t i = (uint32_t)(t & PAV_SHM_MASK);
+        if (fabsf(ring->data[i * 2] - value) > 1e-6f || fabsf(ring->data[i * 2 + 1] - value) > 1e-6f) return false;
+    }
+    return true;
+}
+static int ClientBus(UInt32 clientID) { PAVClient* c = FindClient(clientID); return c ? atomic_load(&c->bus) : -1; }
+
+static void TestRouting(void) {
+    printf("per-app outputs: routed apps leave the main mix and are mixed into the ring of their output\n");
+    SInt64 mainID = 0, busID = 0;
+    PAVSharedRing* mainRing = MakeRing(&mainID);
+    PAVSharedRing* bus = MakeRing(&busID);
+    if (!mainRing || !bus) { printf("  (skipped: no IOSurface here)\n"); return; }
+    CFNumberRef idn = Num64(mainID); SetPlist(kAppPID, kPAVPropSurface, idn); CFRelease(idn);
+    CFDictionaryRef noGains = Table(0, NULL, NULL);       // every client at 100%
+    SetPlist(kAppPID, kPAVPropVolumes, noGains); CFRelease(noGains);
+
+    const SInt64 surfaces[kPAVMaxBuses] = { busID };
+    const char* keys[] = { "b:com.example.player", "5001", "5003" };
+    const float buses[] = { 1, 1, 99 };
+    CHECK(SetRoutesFor(kOtherPID, surfaces, 3, keys, buses) != 0 && atomic_load(&bus->attached) == 0, "another process could route apps");
+    CHECK(SetRoutesFor(kAppPID, surfaces, 3, keys, buses) == 0, "the app couldn't set the routes");
+    CHECK(atomic_load(&bus->attached) == 1, "the bus ring was not attached");
+
+    AddClient(20, 5000, "com.example.player.helper");     // by bundle ID: routed from its first sample
+    AddClient(21, 5001, "com.example.chat");              // by pid
+    AddClient(22, 5002, "com.example.browser");           // not listed: main mix
+    AddClient(23, 5003, "com.example.odd");               // a bus that doesn't exist
+    CHECK(ClientBus(20) == 1 && ClientBus(21) == 1 && ClientBus(22) == 0, "buses %d %d %d, expected 1 1 0", ClientBus(20), ClientBus(21), ClientBus(22));
+    CHECK(ClientBus(23) >= 0 && ClientBus(23) <= kPAVMaxBuses, "bus %d is out of range", ClientBus(23));
+
+    // The client list tells the app where each client goes; reading the routes gives no surface ID away.
+    CFPropertyListRef out = NULL;
+    GetPlist(kOtherPID, kPAVPropRoutes, &out);
+    if (out) {
+        CFTypeRef arr = CFDictionaryGetValue((CFDictionaryRef)out, CFSTR(kPAVRoutesKeySurfaces));
+        CHECK(arr && CFGetTypeID(arr) == CFArrayGetTypeID() && CFArrayGetValueAtIndex((CFArrayRef)arr, 0) == kCFBooleanTrue,
+              "'aprt' should only say whether a bus has a ring");
+        CFRelease(out);
+    } else CHECK(false, "'aprt' not readable");
+
+    PAV_StartIO(gDriverRef, kObjectID_Device, 20);
+    for (uint32_t i = 0; i < PAV_SHM_FRAMES * 2; ++i) bus->data[i] = 9.0f;   // whatever the ring held a lap ago
+
+    // One cycle, everyone with the same buffer: the routed clients' audio is gone from the main mix...
+    Left l20 = ClientCycle(20, 0, 256, 0.25f), l21 = ClientCycle(21, 0, 256, 0.5f), l22 = ClientCycle(22, 0, 256, 0.125f);
+    CHECK(l20.first == 0 && l20.last == 0 && l21.first == 0 && l21.last == 0, "routed clients are still in the main mix");
+    CHECK(l22.first == 0.125f && l22.last == 0.125f, "an unrouted client was changed: %.3f", l22.first);
+    CHECK(atomic_load(&bus->writeEnd) == 0, "the bus was readable before the cycle ended");
+    MixCycle(0, 256, 0.125f);
+    // ...and summed in their bus.
+    CHECK(RingIs(bus, 0, 256, 0.75f), "bus holds %.3f, expected 0.25 + 0.5", bus->data[0]);
+    CHECK(atomic_load(&bus->writeEnd) == 256 && atomic_load(&bus->chunkFrames) == 256, "bus writeEnd %llu, chunk %u",
+          atomic_load(&bus->writeEnd), atomic_load(&bus->chunkFrames));
+    CHECK(RingIs(mainRing, 0, 256, 0.125f) && atomic_load(&mainRing->writeEnd) == 256, "main mix %.3f", mainRing->data[0]);
+
+    // Clients with different buffer sizes: one writes 512 frames ahead, the other follows in two halves.
+    ClientCycle(20, 256, 512, 0.25f); MixCycle(256, 512, 0);
+    CHECK(atomic_load(&bus->writeEnd) == 768, "bus writeEnd %llu after the big write", atomic_load(&bus->writeEnd));
+    ClientCycle(21, 256, 256, 0.5f);  MixCycle(256, 256, 0);
+    ClientCycle(21, 512, 256, 0.5f);  MixCycle(512, 256, 0);
+    CHECK(RingIs(bus, 256, 768, 0.75f), "overlapping cycles: %.3f / %.3f, expected 0.75", bus->data[256 * 2], bus->data[767 * 2]);
+    CHECK(atomic_load(&bus->writeEnd) == 768, "bus writeEnd went back to %llu", atomic_load(&bus->writeEnd));
+
+    // A cycle in which no routed client plays is silence, not what the ring held before.
+    ClientCycle(22, 768, 256, 0.125f); MixCycle(768, 256, 0.125f);
+    CHECK(RingIs(bus, 768, 1024, 0) && atomic_load(&bus->writeEnd) == 1024, "an idle bus plays %.3f", bus->data[768 * 2]);
+    // So is a gap the IO thread skipped.
+    ClientCycle(20, 1536, 256, 0.25f); MixCycle(1536, 256, 0);
+    CHECK(RingIs(bus, 1024, 1536, 0) && RingIs(bus, 1536, 1792, 0.25f), "gap: %.3f, after it: %.3f", bus->data[1024 * 2], bus->data[1536 * 2]);
+
+    // Moving a client to another output fades it over, with nothing lost in between.
+    const char* keys2[] = { "5000", "5001" };
+    const float buses2[] = { 0, 1 };
+    SetRoutesFor(kAppPID, NULL, 2, keys2, buses2);
+    CHECK(ClientBus(20) == 0, "the pid entry didn't override the bundle ID");
+    Left fade = ClientCycle(20, 1792, 256, 0.25f);
+    CHECK(fade.first < 0.01f && fade.last == 0.25f, "fade into the main mix: %.3f ... %.3f", fade.first, fade.last);
+    CHECK(fabsf(bus->data[1792 * 2] + fade.first - 0.25f) < 1e-6f && fabsf(bus->data[2047 * 2] + fade.last - 0.25f) < 1e-6f,
+          "the two halves of the cross-fade don't add up: %.3f + %.3f", bus->data[1792 * 2], fade.first);
+    MixCycle(1792, 256, 0);
+    l20 = ClientCycle(20, 2048, 256, 0.25f); MixCycle(2048, 256, 0.25f);
+    CHECK(l20.first == 0.25f && RingIs(bus, 2048, 2304, 0), "after the fade the client is in the main mix only");
+
+    // A bus that lost its ring (its device went away): the client is heard on the main output again.
+    const SInt64 none[kPAVMaxBuses] = { 0 };
+    SetRoutesFor(kAppPID, none, 2, keys2, buses2);
+    ClientCycle(21, 2304, 256, 0.5f); MixCycle(2304, 256, 0);
+    Left l = ClientCycle(21, 2560, 256, 0.5f);
+    CHECK(l.first == 0.5f && l.last == 0.5f, "a client whose bus has no ring is silent (%.3f)", l.first);
+
+    // Restarting IO restarts the timeline for the buses too.
+    SetRoutesFor(kAppPID, surfaces, 2, keys2, buses2);
+    ClientCycle(21, 2816, 256, 0.5f); MixCycle(2816, 256, 0);   // one cycle to fade back
+    uint32_t gen = atomic_load(&bus->generation);
+    PAV_StopIO(gDriverRef, kObjectID_Device, 20);
+    PAV_StartIO(gDriverRef, kObjectID_Device, 20);
+    CHECK(atomic_load(&bus->writeEnd) == 0 && atomic_load(&bus->generation) != gen, "the bus kept the old timeline");
+    ClientCycle(21, 0, 256, 0.5f); MixCycle(0, 256, 0);
+    CHECK(RingIs(bus, 0, 256, 0.5f) && atomic_load(&bus->writeEnd) == 256, "after a restart: %.3f, writeEnd %llu",
+          bus->data[0], atomic_load(&bus->writeEnd));
+    PAV_StopIO(gDriverRef, kObjectID_Device, 20);
+
+    SetRoutesFor(kAppPID, none, 0, NULL, NULL);
+    CFNumberRef zero = Num64(0); SetPlist(kAppPID, kPAVPropSurface, zero); CFRelease(zero);
+    for (UInt32 c = 20; c <= 23; ++c) RemoveClient(c);
 }
 #pragma clang diagnostic pop
 
@@ -250,6 +406,7 @@ int main(void) {
     TestGainTable();
     TestAccess();
     TestSharedRing();
+    TestRouting();
     TestSampleRates();
     TestLatency();
     printf(gFailures ? "driver: %d FAILED\n" : "driver: all passed\n", gFailures);
