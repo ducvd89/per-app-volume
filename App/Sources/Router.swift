@@ -57,6 +57,8 @@ final class Router: ObservableObject {
     @Published private(set) var inCall = false
     /// The installed driver can send apps to different outputs (drivers before 1.4 can't).
     @Published private(set) var routingSupported = true
+    /// UIDs of connected headphones that another device is playing through (see `DeviceSwitching`).
+    @Published private(set) var elsewhere: Set<String> = []
 
     var realDevices: [AudioDevice] { devices.filter { !$0.isVirtualRouter } }
 
@@ -102,6 +104,22 @@ final class Router: ObservableObject {
     /// What the driver was last told, so it is only told again when something changes.
     private var sentRoutes: (virt: AudioObjectID, surfaces: [Int64], table: [String: Int])?
     private var qRoutingSupported: (virt: AudioObjectID, yes: Bool)?
+
+    // Headphones shared with other devices (see DeviceSwitching).
+    /// Connected headphones another device has: automatic choices leave them alone until they are ours
+    /// again, reconnect, or the user picks them.
+    private var qElsewhere: Set<String> = []
+    /// UID → since when we have been playing to headphones we don't have.
+    private var unownedSince: [String: Date] = [:]
+    private var ownershipListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
+    private var knownBluetooth: Set<AudioObjectID> = []
+    private var ownershipCheck: DispatchWorkItem?
+    /// The real devices automatic choices may use.
+    private var qUsableDevices: [AudioDevice] {
+        let real = qRealDevices
+        let uids = Set(DeviceSwitching.usable(connected: real.map(\.uid), elsewhere: qElsewhere))
+        return real.filter { uids.contains($0.uid) }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -175,6 +193,7 @@ final class Router: ObservableObject {
         rateListener = nil
         if let w = earWatch { CA.unlisten(w.id, CA.kPropInEarStatus, queue: audioQueue, w.listener) }
         earWatch = nil
+        dropOwnershipListeners()
         mic.stop()
         watchedVirtual = nil
         lastLatency = nil
@@ -194,6 +213,7 @@ final class Router: ObservableObject {
             self.callEndWork?.cancel()
             for (obj, sel, scope, l) in self.listeners { CA.unlisten(obj, sel, scope: scope, queue: audioQueue, l) }
             self.listeners.removeAll()
+            self.dropOwnershipListeners()
             if let (dev, l) = self.rateListener { CA.unlisten(dev, kAudioDevicePropertyNominalSampleRate, queue: audioQueue, l) }
             if let t = self.qTarget, let id = CA.device(uid: t.uid) {
                 // Volume first, then the switch: the device must not be the default while still at full volume.
@@ -244,9 +264,20 @@ final class Router: ObservableObject {
     func choose(_ device: AudioDevice) {
         target = device   // optimistic, so the menu checkmark moves immediately
         audioQueue.async {
+            self.forgetElsewhere(device.uid)
             self.promote(device.uid)
             self.applyTarget(device)
             self.publishPriority()
+        }
+    }
+
+    /// The user wants an app on this device: if another device had it, ask for it again.
+    func chosenForApp(uid: String) {
+        audioQueue.async {
+            guard self.qElsewhere.contains(uid) else { return }
+            self.forgetElsewhere(uid)
+            self.syncRoutes()
+            self.publishDevices()
         }
     }
 
@@ -298,9 +329,10 @@ final class Router: ObservableObject {
     }
 
     private func publishDevices() {
-        let d = qDevices, t = qTarget, n = qDeviceNames
+        let d = qDevices, t = qTarget, n = qDeviceNames, e = qElsewhere
         UserDefaults.standard.set(n, forKey: "deviceNames")
         onMain {
+            if self.elsewhere != e { self.elsewhere = e }
             if self.devices != d { self.devices = d }
             if self.target != t { self.target = t }
             if self.deviceNames != n { self.deviceNames = n }
@@ -346,6 +378,7 @@ final class Router: ObservableObject {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         defer { syncRoutes(); publishDevices(); publishPriority() }
         qDevices = CA.allOutputDevices()
+        refreshOwnership()
         if reason == .devicesChanged || reason == .launch { qBusFailed.removeAll() }
         let historyBefore = qPriority   // MRU history before newly seen devices get appended
         for d in qRealDevices where qDeviceNames[d.uid] != d.name { qDeviceNames[d.uid] = d.name }
@@ -396,11 +429,13 @@ final class Router: ObservableObject {
 
         // A device connected (headphones, DAC, Bluetooth, display…). Since our virtual device is the macOS default,
         // macOS won't switch by itself, so apply the rules here (see DeviceSwitching).
-        let currentUIDs = Set(qRealDevices.map(\.uid))
+        // Headphones another device has count as not connected; they "connect" when the Mac gets them.
+        let usable = qUsableDevices
+        let currentUIDs = Set(usable.map(\.uid))
         defer { knownUIDs = currentUIDs }
         defer { resumeAfterEarIfNeeded() }
         if qMode == .followSystem, reason == .devicesChanged, let known = knownUIDs {
-            let appeared = qRealDevices
+            let appeared = usable
                 .filter { !known.contains($0.uid) && DeviceSwitching.canTakeOverOnConnect(transport: $0.transport) }
                 .map(\.uid)
             if let uid = DeviceSwitching.deviceToSwitchTo(appeared: appeared, history: historyBefore),
@@ -419,6 +454,7 @@ final class Router: ObservableObject {
             // In custom-order mode, ignore macOS' automatic switch on connect and fall through to the priority list.
             let autoSwitch = Date().timeIntervalSince(lastDeviceListChange) < 1.5
             if qMode == .followSystem || (!autoSwitch && reason != .launch) {
+                forgetElsewhere(picked.uid)
                 promote(picked.uid)
                 applyTarget(picked)
                 return
@@ -426,11 +462,11 @@ final class Router: ObservableObject {
         }
 
         // Pick by priority.
-        let available = Dictionary(qRealDevices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
+        let available = Dictionary(usable.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
         var next: AudioDevice?
         if qMode == .customOrder || qTarget == nil || available[qTarget!.uid] == nil {
             // Current output gone (or custom order): most recently used / highest priority device still connected.
-            next = DeviceSwitching.fallback(history: qPriority, connected: qRealDevices.map(\.uid)).flatMap { available[$0] }
+            next = DeviceSwitching.fallback(history: qPriority, connected: usable.map(\.uid)).flatMap { available[$0] }
         } else {
             next = available[qTarget!.uid]
         }
@@ -539,7 +575,7 @@ final class Router: ObservableObject {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         guard let virt = qVirtual, !qReleased, routingSupported(virt) else { stopBuses(tellDriver: false); return }
         let devices = Dictionary(qRealDevices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
-        let plan = AppRouting.plan(wants: qRouteWants, connected: Set(devices.keys).subtracting(qBusFailed),
+        let plan = AppRouting.plan(wants: qRouteWants, connected: Set(devices.keys).subtracting(qBusFailed).subtracting(qElsewhere),
                                    main: (main ?? qTarget)?.uid, current: qBuses.mapValues(\.uid), maxBuses: Int(kPAVMaxBuses))
         var buses: [Int: AudioDevice] = [:]
         var surfaces = [Int64](repeating: 0, count: Int(kPAVMaxBuses))
@@ -607,6 +643,7 @@ final class Router: ObservableObject {
             }
         }
         if changed, !MicMonitor.hasProcessAPI { audioQueue.async { [weak self] in self?.mic.refresh() } }
+        checkOwnership()
     }
 
     /// Stops every bus. `tellDriver`: also put every app back in the main mix (when we stop playing the
@@ -620,6 +657,98 @@ final class Router: ObservableObject {
             CA.setPlist(virt, kPropRoutes, Self.routesPlist(surfaces: [Int64](repeating: 0, count: Int(kPAVMaxBuses)), table: [:]))
         }
         sentRoutes = nil
+    }
+
+    // MARK: Headphones shared with other devices (audioQueue)
+    // AirPods that play from an iPhone are connected to the Mac too, and nothing we play to them is heard.
+    // See DeviceSwitching for the rules; here: watch who has them, and time how long we play unheard.
+
+    /// Follows which shared headphones are connected and who has them. Headphones that are ours again or
+    /// that disconnected are no longer "elsewhere" (after reconnecting they get a new try).
+    private func refreshOwnership() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        let real = qRealDevices
+        let shared = real.filter { CA.has($0.id, CA.kPropOwnsAudio) }
+        for (id, l) in ownershipListeners where !shared.contains(where: { $0.id == id }) {
+            CA.unlisten(id, CA.kPropOwnsAudio, queue: audioQueue, l)
+            ownershipListeners[id] = nil
+        }
+        for d in shared where ownershipListeners[d.id] == nil {
+            ownershipListeners[d.id] = CA.listen(d.id, CA.kPropOwnsAudio, queue: audioQueue) { [weak self] in self?.ownershipChanged() }
+        }
+        for uid in qElsewhere {
+            guard let d = shared.first(where: { $0.uid == uid }) else { qElsewhere.remove(uid); continue }
+            if CA.ownsAudio(d.id) != false {
+                routeLog.log("\(d.name, privacy: .public) plays for this Mac again")
+                qElsewhere.remove(uid)
+            }
+        }
+        unownedSince = unownedSince.filter { uid, _ in real.contains { $0.uid == uid } }
+
+        // Headphones that just connected may not say yet whether they are shared: look once more.
+        let bluetooth = Set(real.filter { [kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE].contains($0.transport) }.map(\.id))
+        if !bluetooth.isSubset(of: knownBluetooth) {
+            audioQueue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.ownershipChanged() }
+        }
+        knownBluetooth = bluetooth
+    }
+
+    private func dropOwnershipListeners() {
+        for (id, l) in ownershipListeners { CA.unlisten(id, CA.kPropOwnsAudio, queue: audioQueue, l) }
+        ownershipListeners.removeAll()
+        knownBluetooth.removeAll()
+        ownershipCheck?.cancel(); ownershipCheck = nil
+        unownedSince.removeAll()
+    }
+
+    private func ownershipChanged() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        let before = qElsewhere
+        refreshOwnership()
+        if qElsewhere != before { reevaluate(reason: .devicesChanged) } else { checkOwnership() }
+    }
+
+    /// Chosen by hand (or reconnected): try it again.
+    private func forgetElsewhere(_ uid: String) {
+        qElsewhere.remove(uid)
+        unownedSince[uid] = nil
+    }
+
+    /// Looks at the outputs we are playing to. Headphones the Mac still doesn't have after
+    /// `DeviceSwitching.ownershipGrace` are left to the device that has them: the main output falls back
+    /// like when a device disconnects, and apps with those headphones as their output play on the main one.
+    private func checkOwnership() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        ownershipCheck?.cancel(); ownershipCheck = nil
+        // During a call apps play straight to the device and macOS looks after it.
+        guard qVirtual != nil, !qReleased, qCallState == .none else { unownedSince.removeAll(); return }
+        var playing: [AudioDevice] = []
+        if let t = qTarget, PAVEngineIsRunning() { playing.append(t) }
+        for (bus, dev) in qBuses where PAVBusIsRunning(Int32(bus)) { playing.append(dev) }
+        unownedSince = unownedSince.filter { uid, _ in playing.contains { $0.uid == uid } }
+
+        let now = Date()
+        var lost: [AudioDevice] = []
+        var wait: TimeInterval?
+        for dev in playing where !qElsewhere.contains(dev.uid) {
+            let since = unownedSince[dev.uid] ?? now
+            switch DeviceSwitching.ownership(owned: CA.ownsAudio(dev.id), unownedFor: now.timeIntervalSince(since)) {
+            case .ours: unownedSince[dev.uid] = nil
+            case .asking(let left): unownedSince[dev.uid] = since; wait = min(wait ?? left, left)
+            case .elsewhere: lost.append(dev)
+            }
+        }
+        for dev in lost {
+            routeLog.log("\(dev.name, privacy: .public) is playing from another device: not using it")
+            qElsewhere.insert(dev.uid)
+            unownedSince[dev.uid] = nil
+        }
+        if !lost.isEmpty { audioQueue.async { [weak self] in self?.reevaluate(reason: .devicesChanged) } }
+        if let wait {
+            let w = DispatchWorkItem { [weak self] in self?.ownershipCheck = nil; self?.checkOwnership() }
+            ownershipCheck = w
+            audioQueue.asyncAfter(deadline: .now() + wait + 0.05, execute: w)
+        }
     }
 
     // MARK: AirPods ear detection (audioQueue)

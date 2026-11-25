@@ -36,7 +36,8 @@ struct PopoverView: View {
                         Button {
                             router.choose(d)
                         } label: {
-                            if d.id == router.target?.id { Label(d.name, systemImage: "checkmark") } else { Text(d.name) }
+                            let name = d.name + (router.elsewhere.contains(d.uid) ? " (in use by another device)" : "")
+                            if d.id == router.target?.id { Label(name, systemImage: "checkmark") } else { Text(name) }
                         }
                     }
                 } label: {
@@ -240,7 +241,9 @@ struct OutputMenuItems: View {
         }
         Divider()
         ForEach(router.realDevices) { d in
-            Button { store.setOutput(d.uid, for: keys) } label: { item(d.name, checked: current == d.uid) }
+            Button { store.setOutput(d.uid, for: keys) } label: {
+                item(d.name + (router.elsewhere.contains(d.uid) ? " (in use by another device)" : ""), checked: current == d.uid)
+            }
         }
         // The saved device, while it isn't connected: the app plays on the main output until it is back.
         if let c = current, !router.realDevices.contains(where: { $0.uid == c }) {
@@ -260,14 +263,17 @@ struct OutputTag: View {
     let uid: String
 
     var body: some View {
-        let connected = router.realDevices.contains { $0.uid == uid }
+        let elsewhere = router.elsewhere.contains(uid)
+        let connected = router.realDevices.contains { $0.uid == uid } && !elsewhere
         let name = router.deviceNames[uid] ?? "Unknown device"
+        let main = router.target?.name ?? "the main output"
         Text("→ \(name)")
             .font(.system(size: 10)).lineLimit(1).truncationMode(.tail)
             .foregroundStyle(connected ? .secondary : .tertiary)
             .strikethrough(!connected)
             .help(connected ? "Plays on \(name)"
-                            : "\(name) isn't connected: playing on \(router.target?.name ?? "the main output") until it is")
+                  : elsewhere ? "\(name) is in use by another device: playing on \(main) until this Mac has it"
+                  : "\(name) isn't connected: playing on \(main) until it is")
     }
 }
 
@@ -358,6 +364,7 @@ struct SettingsView: View {
                         Text("\(idx + 1).").monospacedDigit().foregroundStyle(.secondary)
                         Text(router.deviceNames[uid] ?? uid).foregroundStyle(connected ? .primary : .secondary)
                         if !connected { Text("(not connected)").font(.caption).foregroundStyle(.tertiary) }
+                        else if router.elsewhere.contains(uid) { Text("(in use by another device)").font(.caption).foregroundStyle(.tertiary) }
                         Spacer()
                         Button { router.movePriority(from: idx, to: idx - 1) } label: { Image(systemName: "chevron.up") }
                             .buttonStyle(.borderless).disabled(idx == 0)

@@ -35,4 +35,35 @@ enum DeviceSwitching {
     static func fallback(history: [String], connected: [String]) -> String? {
         history.first { connected.contains($0) } ?? connected.first
     }
+
+    // MARK: Headphones shared with other devices
+    // AirPods connect to the Mac while they play from an iPhone. They are in the device list then, but what
+    // the Mac plays to them isn't heard. Playing to them is also how the Mac asks for them, and the iPhone
+    // gives them up unless it is playing something itself. So such headphones are tried like any other
+    // device, and given up (as if they weren't connected) when the Mac doesn't get them.
+
+    /// How long we play to headphones the Mac doesn't have before giving up. When they are free the Mac
+    /// gets them in about a second; macOS itself moves to the speakers 2 s after being refused (which takes
+    /// most of another second).
+    static let ownershipGrace: TimeInterval = 3
+
+    enum Ownership: Equatable {
+        case ours                   // heard (or a device that can't be shared at all)
+        case asking(TimeInterval)   // look again after this long
+        case elsewhere              // another device has them: use something else
+    }
+
+    /// What to make of an output we are playing to. `owned`: nil for devices that aren't shared;
+    /// `unownedFor`: how long we have been playing to it without having it.
+    static func ownership(owned: Bool?, unownedFor: TimeInterval) -> Ownership {
+        guard owned == false else { return .ours }
+        return unownedFor >= ownershipGrace ? .elsewhere : .asking(ownershipGrace - unownedFor)
+    }
+
+    /// The devices automatic choices may use: not the ones another device has. All of them if nothing
+    /// else is left (better to keep the choice than to have no output).
+    static func usable(connected: [String], elsewhere: Set<String>) -> [String] {
+        let rest = connected.filter { !elsewhere.contains($0) }
+        return rest.isEmpty ? connected : rest
+    }
 }

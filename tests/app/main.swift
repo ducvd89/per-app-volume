@@ -26,6 +26,20 @@ do {
           "output gone: the most recent device that is still connected")
     check(DeviceSwitching.fallback(history: history, connected: ["new"]) == "new", "nothing known is connected: any device")
     check(DeviceSwitching.fallback(history: history, connected: []) == nil, "no devices at all")
+    // Headphones shared with other devices (AirPods playing from an iPhone).
+    let grace = DeviceSwitching.ownershipGrace
+    check(DeviceSwitching.ownership(owned: nil, unownedFor: 60) == .ours, "a device that can't be shared is always ours")
+    check(DeviceSwitching.ownership(owned: true, unownedFor: 0) == .ours, "headphones the Mac has")
+    check(DeviceSwitching.ownership(owned: false, unownedFor: 0) == .asking(grace), "just started playing: wait for the answer")
+    check(DeviceSwitching.ownership(owned: false, unownedFor: 1) == .asking(grace - 1), "still waiting")
+    check(DeviceSwitching.ownership(owned: false, unownedFor: grace) == .elsewhere, "not ours after the grace time: give up")
+    check(DeviceSwitching.usable(connected: ["airpods", "speakers"], elsewhere: ["airpods"]) == ["speakers"],
+          "headphones another device has aren't used")
+    check(DeviceSwitching.fallback(history: history, connected: DeviceSwitching.usable(connected: ["airpods", "speakers"], elsewhere: ["airpods"])) == "speakers",
+          "fallback skips headphones another device has")
+    check(DeviceSwitching.usable(connected: ["airpods", "speakers"], elsewhere: []) == ["airpods", "speakers"], "nothing elsewhere")
+    check(DeviceSwitching.usable(connected: ["airpods"], elsewhere: ["airpods"]) == ["airpods"], "the only device stays usable")
+    check(DeviceSwitching.usable(connected: ["speakers"], elsewhere: ["gone"]) == ["speakers"], "unknown UIDs don't matter")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeBluetooth), "Bluetooth takes over")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeUSB), "USB takes over")
     for t in [kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAirPlay] {

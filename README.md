@@ -72,6 +72,11 @@ Quitting the app sends audio back to your real device.
   Bluetooth headsets switch to while their microphone is on. Any other rate is converted.
 - AirPods ear detection: taking AirPods out of your ears pauses playback and putting them back in resumes it.
   macOS only does this itself when the AirPods are the default output, not a virtual device.
+- AirPods in use by another device: AirPods connect to the Mac while they play from your iPhone, and what the
+  Mac plays to them then isn't heard. Per-App Volume asks for them like macOS does; if the iPhone keeps them
+  (it is playing something), the output goes back to the previous device after 3 seconds, and apps with the
+  AirPods as their own output play on the main output. They are used again once the Mac has them, when they
+  reconnect, or when you pick them.
 
 **Everything else**
 

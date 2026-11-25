@@ -125,6 +125,18 @@ enum CA {
         return [kPropInEarPrimary, kPropInEarSecondary].filter { (get(dev, $0, default: UInt32(0)) ?? 0) == 1 }.count
     }
 
+    /// 'boac' (private Bluetooth HAL property, "owns audio connection"): only on headphones that Apple
+    /// devices share between them (AirPods, Beats). They stay connected to several devices at once and
+    /// play for one of them; 0 while that is another device (an iPhone playing through them).
+    static let kPropOwnsAudio: AudioObjectPropertySelector = 0x626F_6163   // 'boac'
+
+    /// Whether this Mac has the headphones' audio, or nil for devices that aren't shared like that.
+    /// Playing to headphones another device has is how the Mac asks for them; that device may refuse.
+    static func ownsAudio(_ dev: AudioObjectID) -> Bool? {
+        guard has(dev, kPropOwnsAudio) else { return nil }
+        return get(dev, kPropOwnsAudio, default: UInt32(1)).map { $0 != 0 }
+    }
+
     static func device(uid: String) -> AudioObjectID? {
         allOutputDevices().first { $0.uid == uid }?.id
     }

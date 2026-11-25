@@ -141,6 +141,7 @@ final class AppStore: ObservableObject {
         for k in keys { outputs[k] = uid }
         if uid != nil { everPlayed.formUnion(keys) }   // stays listed, like an app with a volume of its own
         persist(); push()
+        if let uid { router.chosenForApp(uid: uid) }
     }
     func setHidden(_ h: Bool, for keys: [String]) {
         for k in keys { if h { hidden.insert(k) } else { hidden.remove(k) } }
