@@ -40,6 +40,12 @@ do {
     check(DeviceSwitching.usable(connected: ["airpods", "speakers"], elsewhere: []) == ["airpods", "speakers"], "nothing elsewhere")
     check(DeviceSwitching.usable(connected: ["airpods"], elsewhere: ["airpods"]) == ["airpods"], "the only device stays usable")
     check(DeviceSwitching.usable(connected: ["speakers"], elsewhere: ["gone"]) == ["speakers"], "unknown UIDs don't matter")
+    // The level headphones arrive with (AirPods coming over from an iPhone at 69%).
+    check(DeviceSwitching.arrivalLevel(before: 1, now: 0.69) == 0.69, "a level reported after we set full volume is taken over")
+    check(DeviceSwitching.arrivalLevel(before: 1, now: 1) == nil, "still at full volume: nothing reported")
+    check(DeviceSwitching.arrivalLevel(before: 0.8, now: 0.8) == nil, "a level it already had before playing stays")
+    check(DeviceSwitching.arrivalLevel(before: 0.8, now: 0.5) == 0.5, "a new level replaces one left from before")
+    check(DeviceSwitching.arrivalLevel(before: 0.8, now: 1) == nil, "back at full volume: nothing to take over")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeBluetooth), "Bluetooth takes over")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeUSB), "USB takes over")
     for t in [kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAirPlay] {

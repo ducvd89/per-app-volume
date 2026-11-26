@@ -194,6 +194,7 @@ final class Router: ObservableObject {
         if let w = earWatch { CA.unlisten(w.id, CA.kPropInEarStatus, queue: audioQueue, w.listener) }
         earWatch = nil
         dropOwnershipListeners()
+        arrivalCheck?.cancel(); arrivalCheck = nil; arrival = nil
         mic.stop()
         watchedVirtual = nil
         lastLatency = nil
@@ -503,6 +504,7 @@ final class Router: ObservableObject {
             volumeHandedBack = true
         } else if changed || volumeHandedBack {
             takeOverVolume(from: device); volumeHandedBack = false
+            expectArrivalLevel()
         }
         publishDevices()
 
@@ -705,6 +707,8 @@ final class Router: ObservableObject {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         let before = qElsewhere
         refreshOwnership()
+        // Headphones the Mac just got from another device start playing for us now.
+        if let t = qTarget, CA.ownsAudio(t.id) == true { expectArrivalLevel() }
         if qElsewhere != before { reevaluate(reason: .devicesChanged) } else { checkOwnership() }
     }
 
@@ -920,7 +924,9 @@ final class Router: ObservableObject {
         if virtualIsRunning() {
             stopWork?.cancel(); stopWork = nil
             if force || !PAVEngineIsRunning() {
+                expectArrivalLevel()   // AirPods report their level while the stream starts
                 let st = PAVEngineStart(virt, t.id)
+                checkArrivalLevel()
                 publishState(st == noErr ? .running : .error("Couldn't open \(t.name) (\(st))"))
                 setPlaying(st == noErr)
             }
@@ -986,6 +992,49 @@ final class Router: ObservableObject {
             CA.setHardwareMute(device.id, false)
         }
         refreshCachedMaster()
+    }
+
+    // The level a device arrives with (see DeviceSwitching): headphones report it after we took their volume
+    // over, and macOS sets the device to it. Left there it would apply on top of the master volume, and the
+    // volume keys couldn't make up for it.
+
+    /// The output we expect a level from: what it was at when the window opened, and until when.
+    private var arrival: (dev: AudioObjectID, level: Float, until: Date)?
+    private var arrivalCheck: DispatchWorkItem?
+
+    /// Call when the output's volume was taken over, before it starts playing, and when the Mac gets it
+    /// from another device.
+    private func expectArrivalLevel() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        checkArrivalLevel()   // a window that is still open: don't lose what it would have seen
+        arrivalCheck?.cancel(); arrivalCheck = nil
+        guard !volumeHandedBack, let t = qTarget, let hw = CA.hardwareVolume(t.id) else { arrival = nil; return }
+        arrival = (t.id, hw, Date().addingTimeInterval(DeviceSwitching.arrivalWindow))
+        scheduleArrivalCheck()
+    }
+
+    /// The Bluetooth HAL doesn't reliably notify listeners of a level the headphones set, so look.
+    private func scheduleArrivalCheck() {
+        let w = DispatchWorkItem { [weak self] in self?.arrivalCheck = nil; self?.checkArrivalLevel() }
+        arrivalCheck = w
+        audioQueue.asyncAfter(deadline: .now() + 0.25, execute: w)
+    }
+
+    private func checkArrivalLevel() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard let a = arrival else { return }
+        arrivalCheck?.cancel(); arrivalCheck = nil
+        // Not while apps play straight to the device (a call) or after it got its level back.
+        guard !volumeHandedBack, let t = qTarget, t.id == a.dev, let hw = CA.hardwareVolume(t.id) else { arrival = nil; return }
+        if DeviceSwitching.arrivalLevel(before: a.level, now: hw) != nil {
+            volLog.log("\(t.name, privacy: .public) arrived at its own level")
+            arrival = nil
+            takeOverVolume(from: t)
+        } else if Date() < a.until {
+            scheduleArrivalCheck()
+        } else {
+            arrival = nil
+        }
     }
 
     /// Gives the device its level back. False if the device can't be reached right now (try again later).

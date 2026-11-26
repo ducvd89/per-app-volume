@@ -60,6 +60,23 @@ enum DeviceSwitching {
         return unownedFor >= ownershipGrace ? .elsewhere : .asking(ownershipGrace - unownedFor)
     }
 
+    // MARK: The level headphones arrive with
+    // Bluetooth headphones say what level they are at only once they play for us: AirPods coming over from
+    // an iPhone bring the level they had there. By then we have set the device to full volume and made its
+    // old level the master volume, so the level they report would apply on top of ours.
+
+    /// How long after we start playing to a device (or the Mac gets it from another device) a level it
+    /// changes to is the level it arrived with. AirPods report it as the stream starts, other headphones
+    /// a quarter of a second after they connect.
+    static let arrivalWindow: TimeInterval = 3
+
+    /// The level to take over (it becomes the master volume and the device goes back to full volume), if
+    /// the device reported one. `before`: its level when the window opened. Changes after the window are
+    /// left alone: the volume buttons on headphones keep working below our level.
+    static func arrivalLevel(before: Float, now: Float) -> Float? {
+        abs(now - before) > 0.005 && now < 0.999 ? now : nil
+    }
+
     /// The devices automatic choices may use: not the ones another device has. All of them if nothing
     /// else is left (better to keep the choice than to have no output).
     static func usable(connected: [String], elsewhere: Set<String>) -> [String] {

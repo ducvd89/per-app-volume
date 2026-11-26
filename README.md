@@ -49,6 +49,8 @@ Quitting the app sends audio back to your real device.
   under the game.
 - The master volume follows the keyboard volume keys and shows the macOS HUD. 100% is the real maximum of your
   output device: the device itself runs at full volume and its previous level becomes the master volume.
+  Headphones that report their level only when they start playing (AirPods coming over from an iPhone bring
+  the level they had there) are treated the same way then.
 
 **The app list**
 
