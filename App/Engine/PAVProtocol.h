@@ -30,7 +30,10 @@
 //   "surfaces": array of kPAVMaxBuses IOSurface IDs, the ring of bus 1, 2, … (0 = none)
 //   "routes":   dictionary { "<pid>" | "b:<bundle id>" : bus }, looked up like the gain table; 0 = main mix
 // A client whose bus has no ring stays in the main mix.
-#define kPAVMaxBuses          4
+// Reading 'aprt' gives the route table and, as "surfaces", one boolean per bus the driver has (whether
+// it has a ring). Drivers before 1.5 have 4 buses and send a route to a higher bus to their last one,
+// so the app must not use more buses than that array has entries.
+#define kPAVMaxBuses          10
 #define kPAVRoutesKeySurfaces "surfaces"
 #define kPAVRoutesKeyRoutes   "routes"
 

@@ -271,6 +271,8 @@ static void TestRouting(void) {
         CFTypeRef arr = CFDictionaryGetValue((CFDictionaryRef)out, CFSTR(kPAVRoutesKeySurfaces));
         CHECK(arr && CFGetTypeID(arr) == CFArrayGetTypeID() && CFArrayGetValueAtIndex((CFArrayRef)arr, 0) == kCFBooleanTrue,
               "'aprt' should only say whether a bus has a ring");
+        // The app reads how many buses the driver has from the length of this array.
+        CHECK(arr && CFArrayGetCount((CFArrayRef)arr) == kPAVMaxBuses, "'aprt' should list every bus the driver has");
         CFRelease(out);
     } else CHECK(false, "'aprt' not readable");
 
@@ -334,6 +336,26 @@ static void TestRouting(void) {
     ClientCycle(21, 0, 256, 0.5f); MixCycle(0, 256, 0);
     CHECK(RingIs(bus, 0, 256, 0.5f) && atomic_load(&bus->writeEnd) == 256, "after a restart: %.3f, writeEnd %llu",
           bus->data[0], atomic_load(&bus->writeEnd));
+
+    // The last bus works like the first.
+    SInt64 lastID = 0;
+    PAVSharedRing* last = MakeRing(&lastID);
+    if (last) {
+        SInt64 both[kPAVMaxBuses] = { busID };
+        both[kPAVMaxBuses - 1] = lastID;
+        const char* keys3[] = { "5001", "5002" };
+        const float buses3[] = { 1, kPAVMaxBuses };
+        CHECK(SetRoutesFor(kAppPID, both, 2, keys3, buses3) == 0 && atomic_load(&last->attached) == 1, "the last bus got no ring");
+        CHECK(ClientBus(22) == kPAVMaxBuses, "bus %d, expected the last one", ClientBus(22));
+        ClientCycle(21, 256, 256, 0.5f); ClientCycle(22, 256, 256, 0.125f); MixCycle(256, 256, 0);   // one cycle to fade over
+        ClientCycle(21, 512, 256, 0.5f);
+        Left l22b = ClientCycle(22, 512, 256, 0.125f);
+        MixCycle(512, 256, 0);
+        CHECK(l22b.first == 0 && l22b.last == 0, "a client on the last bus is still in the main mix");
+        CHECK(RingIs(last, 512, 768, 0.125f) && RingIs(bus, 512, 768, 0.5f), "last bus %.3f, first bus %.3f, expected 0.125 and 0.5",
+              last->data[512 * 2], bus->data[512 * 2]);
+        CHECK(atomic_load(&last->writeEnd) == 768, "last bus writeEnd %llu", atomic_load(&last->writeEnd));
+    }
     PAV_StopIO(gDriverRef, kObjectID_Device, 20);
 
     SetRoutesFor(kAppPID, none, 0, NULL, NULL);

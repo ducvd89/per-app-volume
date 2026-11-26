@@ -95,6 +95,11 @@ do {
     p = AppRouting.plan(wants: ["10": "dac"], connected: connected, main: nil, current: [:], maxBuses: 0)
     check(p.buses.isEmpty && p.table == ["10": 0], "no buses at all")
 
+    let many = Dictionary(uniqueKeysWithValues: (1...12).map { ("\($0)", "dev\($0)") })
+    p = AppRouting.plan(wants: many, connected: Set(many.values), main: "speakers", current: [:], maxBuses: 10)
+    check(p.buses.count == 10 && Set(p.buses.keys) == Set(1...10) && p.table.values.filter { $0 == 0 }.count == 2,
+          "ten buses: ten devices play, the rest are on the main output")
+
     check(AppRouting.isBundleID("com.example.app") && !AppRouting.isBundleID("/Applications/Foo.app")
           && !AppRouting.isBundleID("wine:foo.exe") && !AppRouting.isBundleID("proc:afplay") && !AppRouting.isBundleID(""),
           "only bundle IDs are sent to the driver as such")
@@ -129,7 +134,7 @@ print("constants shared with the driver")
 do {
     check(kPropClients == 0x6170_636C && kPropVolumes == 0x6170_766C && kPropLatency == 0x6170_6C74, "property selectors")
     check(kVirtualDeviceUID == "PerAppVolume_UID", "device UID")
-    check(kPropRoutes == 0x6170_7274 && kPAVMaxBuses >= 1 && kPAVRoutesKeyRoutes == "routes" && kPAVRoutesKeySurfaces == "surfaces",
+    check(kPropRoutes == 0x6170_7274 && kPAVMaxBuses == 10 && kPAVRoutesKeyRoutes == "routes" && kPAVRoutesKeySurfaces == "surfaces",
           "per-app outputs")
     check(PAVNearestSampleRate(24000) == 24000 && PAVNearestSampleRate(16000) == 16000, "headset rates are matched exactly")
     check(PAVNearestSampleRate(47999.5) == 48000 && PAVNearestSampleRate(384000) == 192000, "nearest supported rate")

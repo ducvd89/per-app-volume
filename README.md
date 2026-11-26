@@ -65,7 +65,7 @@ Quitting the app sends audio back to your real device.
   Devices that stay connected keep their order.
 - Or set your own priority order in Settings, and the first connected device in it is always used.
 - An output device for each app: the speaker button on an app's row sends that app to a device of its own,
-  while everything else stays on the main output. Up to four devices besides the main one can play at once.
+  while everything else stays on the main output. Up to ten devices besides the main one can play at once.
 - The choice is remembered for each app. While its device isn't connected, the app plays on the main output,
   and it moves back by itself when the device returns.
 - An app on a device of its own plays at that device's own volume. The master volume and the volume keys

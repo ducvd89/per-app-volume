@@ -103,7 +103,8 @@ final class Router: ObservableObject {
     private var busRateListeners: [Int: (dev: AudioObjectID, listener: AudioObjectPropertyListenerBlock)] = [:]
     /// What the driver was last told, so it is only told again when something changes.
     private var sentRoutes: (virt: AudioObjectID, surfaces: [Int64], table: [String: Int])?
-    private var qRoutingSupported: (virt: AudioObjectID, yes: Bool)?
+    /// Whether the installed driver has per-app outputs, and how many buses.
+    private var qRoutingSupported: (virt: AudioObjectID, buses: Int)?
 
     // Headphones shared with other devices (see DeviceSwitching).
     /// Connected headphones another device has: automatic choices leave them alone until they are ours
@@ -562,23 +563,29 @@ final class Router: ObservableObject {
         syncRoutes()
     }
 
-    private func routingSupported(_ virt: AudioObjectID) -> Bool {
-        if let s = qRoutingSupported, s.virt == virt { return s.yes }
-        let yes = CA.has(virt, kPropRoutes)
-        qRoutingSupported = (virt, yes)
-        if !yes { routeLog.log("the installed driver has no per-app outputs") }
-        onMain { if self.routingSupported != yes { self.routingSupported = yes } }
-        return yes
+    /// How many buses the installed driver has (0: a driver without per-app outputs).
+    private func driverBuses(_ virt: AudioObjectID) -> Int {
+        if let s = qRoutingSupported, s.virt == virt { return s.buses }
+        var n = 0
+        if CA.has(virt, kPropRoutes) {
+            // One entry per bus (see PAVProtocol.h). A driver that doesn't say has the 4 of 1.4.
+            let rings = (CA.plist(virt, kPropRoutes) as? [String: Any])?[kPAVRoutesKeySurfaces] as? [Any]
+            n = min(Int(kPAVMaxBuses), rings?.count ?? 4)
+        }
+        qRoutingSupported = (virt, n)
+        routeLog.log("the installed driver has \(n) per-app outputs")
+        onMain { if self.routingSupported != (n > 0) { self.routingSupported = n > 0 } }
+        return n
     }
 
     /// Works out which app plays on which bus, tells the driver, and starts and stops the buses.
     /// `main`: the main output, when it is about to change.
     private func syncRoutes(main: AudioDevice? = nil) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        guard let virt = qVirtual, !qReleased, routingSupported(virt) else { stopBuses(tellDriver: false); return }
+        guard let virt = qVirtual, !qReleased, case let driver = driverBuses(virt), driver > 0 else { stopBuses(tellDriver: false); return }
         let devices = Dictionary(qRealDevices.map { ($0.uid, $0) }, uniquingKeysWith: { a, _ in a })
         let plan = AppRouting.plan(wants: qRouteWants, connected: Set(devices.keys).subtracting(qBusFailed).subtracting(qElsewhere),
-                                   main: (main ?? qTarget)?.uid, current: qBuses.mapValues(\.uid), maxBuses: Int(kPAVMaxBuses))
+                                   main: (main ?? qTarget)?.uid, current: qBuses.mapValues(\.uid), maxBuses: driver)
         var buses: [Int: AudioDevice] = [:]
         var surfaces = [Int64](repeating: 0, count: Int(kPAVMaxBuses))
         for (bus, uid) in plan.buses {
