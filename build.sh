@@ -33,6 +33,19 @@ done
 lipo -create "$BUILD/obj/PerAppVolume-arm64" "$BUILD/obj/PerAppVolume-x86_64" -output "$APP/Contents/MacOS/PerAppVolume"
 cp App/Info.plist "$APP/Contents/Info.plist"
 
+# Updates. The app looks for new releases in the GitHub repo it was built from and installs only what was
+# signed with the builder's key (scripts/update-key.swift). Both are written into the built app here, so
+# the source names neither. Without a GitHub remote or without a key, the app has no updater.
+REPO=$(git remote get-url origin 2>/dev/null | sed -nE 's#^(https://github\.com/|git@github\.com:)([^/]+/[^/]+)$#\2#p' | sed 's/\.git$//' || true)
+UPDATE_KEY=$(swift scripts/update-key.swift public 2>/dev/null || true)
+if [ -n "$REPO" ] && [ -n "$UPDATE_KEY" ]; then
+  /usr/libexec/PlistBuddy -c "Add :PAVUpdateRepo string $REPO" -c "Add :PAVUpdateKey string $UPDATE_KEY" "$APP/Contents/Info.plist"
+  echo "==> Updates: on (signed with the key in the Keychain)"
+else
+  UPDATE_KEY=""
+  echo "==> Updates: off (needs a GitHub remote and an update key)"
+fi
+
 echo "==> Icon"
 swiftc -O scripts/make-icon.swift -o "$BUILD/obj/mkicon"
 "$BUILD/obj/mkicon" "$BUILD/obj/AppIcon.iconset"
@@ -48,6 +61,9 @@ mkdir -p dist
 rm -rf "dist/Per-App Volume.app" "dist/Per-App-Volume.zip" "dist/Per-App-Volume.dmg"
 cp -R "$APP" "dist/Per-App Volume.app"
 (cd dist && ditto -c -k --keepParent "Per-App Volume.app" "Per-App-Volume.zip")
+# The signature the app checks before it installs this zip as an update.
+rm -f dist/Per-App-Volume.zip.sig
+if [ -n "$UPDATE_KEY" ]; then swift scripts/update-key.swift sign dist/Per-App-Volume.zip > dist/Per-App-Volume.zip.sig; fi
 
 # Drag-to-install disk image: the app plus a link to /Applications.
 STAGE="$BUILD/dmg"

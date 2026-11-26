@@ -8,6 +8,7 @@ struct PopoverView: View {
     @ObservedObject var store: AppStore
     @ObservedObject var router: Router
     @ObservedObject var installer: DriverInstaller
+    @ObservedObject var updater: Updater
     var openSettings: () -> Void
 
     var body: some View {
@@ -20,6 +21,10 @@ struct PopoverView: View {
             }
             if router.state != .driverMissing {
                 content
+            }
+            if updater.hasNews {
+                Divider()
+                UpdateBanner(updater: updater).padding(.horizontal, 12).padding(.vertical, 8)
             }
             Divider()
             footer
@@ -329,6 +334,7 @@ struct BulkBar: View {
 struct SettingsView: View {
     @ObservedObject var router: Router
     @ObservedObject var installer: DriverInstaller
+    @ObservedObject var updater: Updater
     @AppStorage("hotKeyEnabled") private var hotKeyEnabled = true
     @AppStorage("hotKeyPreset") private var hotKeyPreset = HotKeyPreset.all[0].id
     @StateObject private var login = LoginState()
@@ -379,6 +385,7 @@ struct SettingsView: View {
             Section("Virtual Audio Driver") {
                 DriverPanel(installer: installer)
             }
+            UpdateSection(updater: updater)
             Section("Privacy") {
                 Label("No microphone, no audio capture, no screen recording — no orange or purple dot in the menu bar.",
                       systemImage: "lock.shield")

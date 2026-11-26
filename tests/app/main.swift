@@ -4,6 +4,7 @@
 //  Built together with the app's sources (minus its main.swift) by scripts/test.sh.
 //
 import CoreAudio
+import CryptoKit
 import Foundation
 
 var failures = 0
@@ -128,6 +129,72 @@ do {
     check(WineApp.parseArguments([1, 0]) == nil && WineApp.parseArguments([0, 0, 0, 0, 65, 0]) == nil, "nonsense is refused")
     check(WineApp.identity(pid: getpid()) == nil, "this test is not a Wine program")
     check(WineApp.arguments(getpid())?.first?.hasSuffix("app_test") == true, "a real process's arguments can be read")
+}
+
+print("updates")
+do {
+    check(UpdateLogic.isNewer("1.5.1", than: "1.5.0") && UpdateLogic.isNewer("1.10.0", than: "1.9.3") && UpdateLogic.isNewer("2.0", than: "1.99.99"),
+          "newer versions, compared number by number")
+    check(UpdateLogic.isNewer("v1.6.0", than: "1.5.0") && UpdateLogic.isNewer("1.5.0.1", than: "1.5.0"), "a leading v, a fourth number")
+    check(!UpdateLogic.isNewer("1.5.0", than: "1.5.0") && !UpdateLogic.isNewer("1.5", than: "1.5.0") && !UpdateLogic.isNewer("1.4.9", than: "1.5.0"),
+          "the same or an older version is not an update")
+    check(!UpdateLogic.isNewer("9.9.9-beta", than: "1.0.0") && !UpdateLogic.isNewer("latest", than: "1.0.0") && !UpdateLogic.isNewer("", than: "1.0.0")
+          && !UpdateLogic.isNewer("2.-1", than: "1.0.0") && !UpdateLogic.isNewer("1.2.3.4.5", than: "1.0.0"),
+          "anything that isn't a plain version is never newer")
+
+    check(UpdateLogic.repo("someone/per-app-volume") == "someone/per-app-volume", "a GitHub repo")
+    check(UpdateLogic.repo("someone") == nil && UpdateLogic.repo("a/b/c") == nil && UpdateLogic.repo("a/b?x=1") == nil
+          && UpdateLogic.repo("") == nil && UpdateLogic.repo(nil) == nil, "anything else is no repo: no updater")
+
+    // What GitHub's "releases/latest" returns, cut down to what is read.
+    func latest(tag: String, assets: [(String, String)]) -> Data {
+        let list = assets.map { ["name": $0.0, "browser_download_url": $0.1] }
+        return try! JSONSerialization.data(withJSONObject: ["tag_name": tag, "html_url": "https://example.com/elsewhere", "assets": list])
+    }
+    let dl = "https://github.com/someone/per-app-volume/releases/download/v1.6.0/"
+    let full = [("Per-App-Volume.dmg", dl + "Per-App-Volume.dmg"), ("Per-App-Volume.zip", dl + "Per-App-Volume.zip"),
+                ("Per-App-Volume.zip.sig", dl + "Per-App-Volume.zip.sig")]
+    let r = UpdateLogic.release(fromJSON: latest(tag: "v1.6.0", assets: full), repo: "someone/per-app-volume")
+    check(r?.version == "1.6.0" && r?.zip?.absoluteString == dl + "Per-App-Volume.zip" && r?.signature?.absoluteString == dl + "Per-App-Volume.zip.sig"
+          && r?.installable == true, "the release's zip and its signature")
+    check(r?.page.absoluteString == "https://github.com/someone/per-app-volume/releases/tag/v1.6.0", "the release page is this repo's")
+    // A release the app can't install itself is still announced; it only points to the page.
+    func announced(_ assets: [(String, String)], repo: String = "someone/per-app-volume") -> Bool {
+        let r = UpdateLogic.release(fromJSON: latest(tag: "v1.6.0", assets: assets), repo: repo)
+        return r?.version == "1.6.0" && r?.installable == false && r?.zip == nil && r?.signature == nil
+    }
+    check(announced(Array(full.prefix(2))), "a release without a signature can't be installed")
+    check(announced(Array(full.prefix(1))), "a release with only the disk image (before 1.5)")
+    check(announced(full, repo: "other/per-app-volume"), "files that aren't this repo's downloads are not used")
+    check(announced([full[0], ("Per-App-Volume.zip", "https://example.com/Per-App-Volume.zip"), full[2]]), "a zip from elsewhere is not used")
+    check(UpdateLogic.release(fromJSON: latest(tag: "nightly", assets: full), repo: "someone/per-app-volume") == nil, "a tag that isn't a version")
+    check(UpdateLogic.release(fromJSON: Data("not json".utf8), repo: "someone/per-app-volume") == nil, "not JSON")
+
+    // Signatures: only what was signed with the key the app was built with is installed.
+    let key = Curve25519.Signing.PrivateKey(), other = Curve25519.Signing.PrivateKey()
+    let pub = key.publicKey.rawRepresentation.base64EncodedString()
+    let zip = Data("the zipped app".utf8)
+    let sig = try! key.signature(for: zip).base64EncodedString()
+    check(UpdateLogic.verify(zip, signature: sig, publicKey: pub), "a download signed with the app's key")
+    check(UpdateLogic.verify(zip, signature: sig + "\n", publicKey: pub), "the signature file ends with a newline")
+    check(!UpdateLogic.verify(zip + Data([0]), signature: sig, publicKey: pub), "a download that was changed")
+    check(!UpdateLogic.verify(zip, signature: try! other.signature(for: zip).base64EncodedString(), publicKey: pub), "signed with another key")
+    check(!UpdateLogic.verify(zip, signature: "", publicKey: pub) && !UpdateLogic.verify(zip, signature: "not base64!", publicKey: pub)
+          && !UpdateLogic.verify(zip, signature: sig, publicKey: "") && !UpdateLogic.verify(zip, signature: sig, publicKey: "AAAA"),
+          "no or broken signature, no or broken key")
+
+    let now = Date()
+    check(UpdateLogic.checkDue(last: nil, now: now) && UpdateLogic.checkDue(last: now.addingTimeInterval(-25 * 3600), now: now), "never checked, or a day ago")
+    check(!UpdateLogic.checkDue(last: now.addingTimeInterval(-3600), now: now), "checked an hour ago")
+    check(UpdateLogic.checkDue(last: now.addingTimeInterval(3600), now: now), "the clock went back: check")
+
+    let all: (String) -> Bool = { _ in true }
+    check(UpdateLogic.canReplace(bundlePath: "/Applications/Per-App Volume.app", writable: all), "in Applications")
+    check(!UpdateLogic.canReplace(bundlePath: "/Volumes/Per-App Volume/Per-App Volume.app", writable: all), "run from the disk image")
+    check(!UpdateLogic.canReplace(bundlePath: "/private/var/folders/x/AppTranslocation/1234/d/Per-App Volume.app", writable: all),
+          "run from where macOS put a quarantined copy")
+    check(!UpdateLogic.canReplace(bundlePath: "/Applications/Per-App Volume.app", writable: { $0 != "/Applications" }), "a folder we can't write to")
+    check(!UpdateLogic.canReplace(bundlePath: "/usr/local/bin/tool", writable: all), "not an app bundle")
 }
 
 print("constants shared with the driver")

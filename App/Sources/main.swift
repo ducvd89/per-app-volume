@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let router = Router()
     lazy var store = AppStore(router: router)
     let installer = DriverInstaller()
+    let updater = Updater()
     private var welcomeWindow: NSWindow?
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
@@ -30,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = false
         popover.delegate = self
         let hosting = NSHostingController(
-            rootView: PopoverView(store: store, router: router, installer: installer, openSettings: { [weak self] in self?.showSettings() })
+            rootView: PopoverView(store: store, router: router, installer: installer, updater: updater, openSettings: { [weak self] in self?.showSettings() })
         )
         // Let the popover follow SwiftUI's size as the app list grows/shrinks; otherwise it keeps the old
         // size and ends up floating below the menu bar icon.
@@ -45,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .store(in: &cancellables)
 
         if installer.status != .installed { showWelcome() }
+        updater.start()
     }
 
     func showWelcome() {
@@ -109,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.performClose(nil)
         installer.refresh()
         if settingsWindow == nil {
-            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(router: router, installer: installer)))
+            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(router: router, installer: installer, updater: updater)))
             w.title = "Per-App Volume Settings"
             w.styleMask = [.titled, .closable]
             w.isReleasedWhenClosed = false

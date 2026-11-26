@@ -8,7 +8,8 @@ A macOS menu bar app that gives every app its own volume slider, from 0 to 200%.
 </p>
 
 It asks for no permissions. It never opens the microphone, never captures audio (no process taps) and never
-records the screen, so macOS shows no orange or purple privacy indicator.
+records the screen, so macOS shows no orange or purple privacy indicator. Its only network use is asking
+GitHub once a day whether there is a new release, which you can turn off.
 
 Requires macOS 13 or later, on Apple Silicon or Intel.
 
@@ -27,6 +28,22 @@ Requires macOS 13 or later, on Apple Silicon or Intel.
 
 To update, reinstall or remove the driver, open **Settings → Virtual Audio Driver**. Removing it sends audio
 straight back to your real device, after which you can delete the app.
+
+## Updates
+
+Once a day the app asks GitHub for the latest release. When there is a newer one, the panel and
+**Settings → Updates** show it with an **Update** button: one click downloads it, replaces the app and opens
+it again. Nothing is installed until you click, and playback is only interrupted for the moment the app
+reopens. If the new version has a new driver, the app then offers **Update Driver…** as usual.
+
+- The request to GitHub is the only thing sent: no identifier, no statistics. Turn the daily check off with
+  **Check for updates automatically**; **Check Now** still works.
+- Every update is signed, and the app installs only what matches the signing key it was built with. A
+  download that was changed, or that doesn't come from whoever built your copy, is refused.
+- The app replaces itself only where it can: in Applications or another folder you can write to. Run from the
+  disk image, it offers the download page instead.
+- A release without a signed zip is still announced, with a link to its page instead of the button.
+- Versions before 1.5.0 have no updater; install 1.5.0 by hand once.
 
 ## Using it
 
@@ -169,6 +186,12 @@ Only the Command Line Tools are needed, not Xcode:
 This produces a universal build in `dist/`: `Per-App Volume.app`, `Per-App-Volume.zip` and
 `Per-App-Volume.dmg`. The driver is embedded in the app at `Contents/Resources/PerAppVolume.driver`.
 
+The updater is part of a build only if there is somewhere to update from and a key to trust: `build.sh` writes
+the GitHub repo of the `origin` remote and your public update key into the built app, and signs the zip
+(`dist/Per-App-Volume.zip.sig`). Make the key once with `swift scripts/update-key.swift generate`; it is kept
+in your login Keychain. Without a GitHub remote or a key the build simply has no updater. A release the app
+can update to needs `Per-App-Volume.zip` and `Per-App-Volume.zip.sig` among its files, next to the disk image.
+
 Copy the built app to `/Applications` before running it. If another copy with the same bundle ID is already
 installed there, macOS treats the menu bar icon of a copy started from `dist/` as anonymous: it forgets the
 icon's position on every launch, and menu bar managers (Thaw, Ice…) can't move it.
@@ -206,6 +229,8 @@ switching and per-app output rules. Nothing is installed and no audio device is 
 | `App/Sources/CallMode.swift` | Notices calling apps using the microphone (HAL properties only) |
 | `App/Sources/AppStore.swift` | The app list and the per-app gains and outputs sent to the driver |
 | `App/Sources/DriverInstaller.swift` | Installs, updates and removes the driver from the app |
+| `App/Sources/Updater.swift` | Looks for new releases, checks their signature and installs them |
+| `scripts/update-key.swift` | Makes the key that signs updates, and signs with it |
 | `tests/` | The tests, run by `scripts/test.sh` |
 
 ## Known issues
