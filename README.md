@@ -2,6 +2,11 @@
 
 A macOS menu bar app that gives every app its own volume slider, from 0 to 200%.
 
+<p align="center">
+  <img src="assets/screenshot.png" width="341"
+       alt="The Per-App Volume panel: the output device menu, the master volume, and a slider, level meter and mute button for each app">
+</p>
+
 It asks for no permissions. It never opens the microphone, never captures audio (no process taps) and never
 records the screen, so macOS shows no orange or purple privacy indicator.
 
