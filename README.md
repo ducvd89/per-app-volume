@@ -71,8 +71,11 @@ Quitting the app sends audio back to your real device.
   under the game.
 - The master volume follows the keyboard volume keys and shows the macOS HUD. 100% is the real maximum of your
   output device: the device itself runs at full volume and its previous level becomes the master volume.
-  Headphones that report their level only when they start playing (AirPods coming over from an iPhone bring
-  the level they had there) are treated the same way then.
+  Headphones that report their level only when they start playing are treated the same way then.
+- AirPods and Beats keep their own level instead, and the master volume is that level. When they change it
+  themselves (Personalized Volume, the level they had on your iPhone, a swipe on the stem), the master volume
+  shows what they set, and the volume keys change their level like they do without Per-App Volume. This needs
+  the driver of version 1.6; with an older one they are handled like other devices.
 
 **The app list**
 
@@ -235,8 +238,8 @@ switching and per-app output rules. Nothing is installed and no audio device is 
 
 ## Known issues
 
-- **Force-quit leaves the device at full volume.** While Per-App Volume forwards audio, the real device runs at
-  full volume and the app applies your level. If the app is force-quit or crashes, it can't put the device's own
+- **Force-quit leaves the device at full volume.** While Per-App Volume forwards audio, the real device (other
+  than AirPods and Beats) runs at full volume and the app applies your level. If the app is force-quit or crashes, it can't put the device's own
   level back, and nothing plays until it runs again. Open it again before playing straight to that device.
 - **Picture and sound on a second output.** The virtual device reports the latency of the main output. An app
   playing video on another device with a very different latency (Bluetooth next to wired) can be slightly out

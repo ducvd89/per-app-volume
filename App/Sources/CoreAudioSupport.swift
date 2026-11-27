@@ -7,6 +7,7 @@ let kPropClients: AudioObjectPropertySelector = kPAVPropClients
 let kPropVolumes: AudioObjectPropertySelector = kPAVPropVolumes
 let kPropLatency: AudioObjectPropertySelector = kPAVPropLatency
 let kPropRoutes: AudioObjectPropertySelector = kPAVPropRoutes
+let kPropMaster: AudioObjectPropertySelector = kPAVPropMaster
 
 struct AudioDevice: Identifiable, Hashable {
     let id: AudioObjectID

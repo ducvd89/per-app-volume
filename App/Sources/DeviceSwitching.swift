@@ -77,6 +77,35 @@ enum DeviceSwitching {
         abs(now - before) > 0.005 && now < 0.999 ? now : nil
     }
 
+    // MARK: Headphones that set their own level
+    // AirPods change their level themselves: Personalized Volume moves it with the noise around and with
+    // what you usually listen at, and they come over from an iPhone at the level they had there. At full
+    // volume below a master volume of ours they would be told that you turned them all the way up each time.
+    // So they keep the level they ask for and the master volume is that level: it shows what they set, and
+    // changing it changes theirs. The driver leaves the mix at full level meanwhile (see PAVProtocol.h).
+
+    enum LevelSync: Equatable {
+        case none
+        case toDevice(Float)   // the master volume was changed: the headphones go to it
+        case toMaster(Float)   // the headphones changed their level: the master volume shows it
+    }
+
+    /// What to do so the master volume and the headphones' own level are the same again. `last`: both
+    /// after the previous look (nil: the first one, where the headphones' level counts). A change of the
+    /// master volume (the volume keys, the slider) wins over one the headphones made at the same moment.
+    static func levelSync(master: Float, device: Float, last: (master: Float, device: Float)?) -> LevelSync {
+        guard let last else { return abs(master - device) > 0.0005 ? .toMaster(device) : .none }
+        if abs(master - last.master) > 0.0005 { return .toDevice(master) }
+        if abs(device - last.device) > 0.004 { return .toMaster(device) }   // their level has 127 steps
+        return .none
+    }
+
+    /// The level such headphones start at. Full volume the first time is what versions before 1.6 left
+    /// them at, not a level anyone chose: they start at the master volume instead.
+    static func ownLevel(device: Float, master: Float, seenBefore: Bool) -> Float {
+        !seenBefore && device > 0.999 ? master : device
+    }
+
     /// The devices automatic choices may use: not the ones another device has. All of them if nothing
     /// else is left (better to keep the choice than to have no output).
     static func usable(connected: [String], elsewhere: Set<String>) -> [String] {

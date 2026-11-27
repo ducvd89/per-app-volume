@@ -418,6 +418,58 @@ static void TestLatency(void) {
     CHECK(atomic_load(&gConfigChanges) == before, "an unchanged latency caused a configuration change");
 }
 
+// ---- master volume ----
+
+static void SetMasterScalar(Float32 v) {
+    AudioObjectPropertyAddress a = { kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    PAV_SetPropertyData(gDriverRef, kObjectID_Volume, kOtherPID, &a, 0, NULL, sizeof(v), &v);
+}
+static void SetMasterMute(UInt32 m) {
+    AudioObjectPropertyAddress a = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    PAV_SetPropertyData(gDriverRef, kObjectID_Mute, kOtherPID, &a, 0, NULL, sizeof(m), &m);
+}
+static SInt64 MasterMode(void) {
+    CFPropertyListRef out = NULL; SInt64 v = -1;
+    GetPlist(kOtherPID, kPAVPropMaster, &out);
+    if (out) { CFNumberGetValue((CFNumberRef)out, kCFNumberSInt64Type, &v); CFRelease(out); }
+    return v;
+}
+/// The last sample of a mix cycle of the constant 0.5: what the master volume made of it once ramped.
+static float MixLevel(void) {
+    static uint64_t st = 1 << 20;
+    float buf[256 * 2];
+    for (int n = 0; n < 2; ++n) {   // the first cycle ramps to a new gain, the second one is at it
+        for (int i = 0; i < 512; ++i) buf[i] = 0.5f;
+        AudioServerPlugInIOCycleInfo ci = { 0 }; ci.mOutputTime.mSampleTime = (Float64)st; st += 256;
+        PAV_DoIOOperation(gDriverRef, kObjectID_Device, kObjectID_Stream, 1, kAudioServerPlugInIOOperationWriteMix, 256, &ci, buf, NULL);
+    }
+    return buf[511];
+}
+
+static void TestMasterMode(void) {
+    printf("master volume: applied by the driver, or left to the output device\n");
+    CHECK(MasterMode() == kPAVMasterInDriver, "the driver applies the master volume unless told otherwise: %lld", MasterMode());
+    SetMasterScalar(0.5f);
+    CHECK(fabsf(MixLevel() - 0.5f * 0.25f) < 1e-6f, "master at 50%% in the driver: %f", MixLevel());
+
+    CFNumberRef on = Num64(kPAVMasterOnDevice), off = Num64(kPAVMasterInDriver), bad = Num64(2);
+    CHECK(SetPlist(kOtherPID, kPAVPropMaster, on) != 0 && MasterMode() == kPAVMasterInDriver, "another process could change who applies the master volume");
+    CHECK(SetPlist(kAppPID, kPAVPropMaster, bad) != 0 && MasterMode() == kPAVMasterInDriver, "an unknown mode was accepted");
+    CHECK(SetPlist(kAppPID, kPAVPropMaster, on) == 0 && MasterMode() == kPAVMasterOnDevice, "set refused for the app");
+    CHECK(fabsf(MixLevel() - 0.5f) < 1e-6f, "the device applies the master volume: the mix must stay at full level, got %f", MixLevel());
+    SetMasterScalar(0.25f);
+    CHECK(fabsf(MixLevel() - 0.5f) < 1e-6f, "a volume change reached the mix although the device applies it: %f", MixLevel());
+    SetMasterMute(1);
+    CHECK(MixLevel() == 0.0f, "mute must silence the mix in both modes: %f", MixLevel());
+    SetMasterMute(0);
+    CHECK(fabsf(MixLevel() - 0.5f) < 1e-6f, "after unmuting: %f", MixLevel());
+
+    CHECK(SetPlist(kAppPID, kPAVPropMaster, off) == 0 && MasterMode() == kPAVMasterInDriver, "back to the driver");
+    CHECK(fabsf(MixLevel() - 0.5f * 0.0625f) < 1e-6f, "master at 25%% in the driver again: %f", MixLevel());
+    SetMasterScalar(1.0f);
+    CFRelease(on); CFRelease(off); CFRelease(bad);
+}
+
 int main(void) {
     CFUUIDRef type = kAudioServerPlugInTypeUUID;
     CHECK(PAV_Create(NULL, type) == gDriverRef, "factory");
@@ -431,6 +483,7 @@ int main(void) {
     TestRouting();
     TestSampleRates();
     TestLatency();
+    TestMasterMode();
     printf(gFailures ? "driver: %d FAILED\n" : "driver: all passed\n", gFailures);
     return gFailures ? 1 : 0;
 }

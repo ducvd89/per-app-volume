@@ -20,8 +20,9 @@
 //   'apsf'  get/set CFNumber                                    shared ring (see PAVShared.h)
 //   'aplt'  get/set CFNumber                                    frames of latency to report
 //   'aprt'  get/set CFDictionary{surfaces, routes}              per-app outputs (see PAVProtocol.h)
+//   'apms'  get/set CFNumber                                    who applies the master volume (see PAVProtocol.h)
 //
-//  The properties that carry audio or change behaviour ('apad', 'apsf', 'aplt', setting 'apvl' or 'aprt')
+//  The properties that carry audio or change behaviour ('apad', 'apsf', 'aplt', setting 'apvl', 'aprt' or 'apms')
 //  only answer the companion app: see CallerMayControl().
 //
 
@@ -76,7 +77,7 @@ enum {
 
 #define kSampleRates    kPAVSampleRates
 #define kNumSampleRates ((UInt32)kPAVNumSampleRates)
-#define kNumCustomProps 6
+#define kNumCustomProps 7
 
 #pragma mark - State
 
@@ -105,6 +106,7 @@ static Float64 gClockTicksPerFrame = 0;  // rate the virtual clock runs at right
 static Float32        gVolumeScalar = 1.0f;     // under gStateMutex
 static _Atomic float  gMasterGain   = 1.0f;     // linear, read on IO thread
 static _Atomic bool   gMuted        = false;
+static _Atomic bool   gMasterOnDevice = false;  // the output device applies the master volume (see PAVProtocol.h)
 static float          gMasterApplied = 1.0f;    // IO thread only
 
 // Mixed audio ring (written on IO thread, read by property getter)
@@ -476,6 +478,16 @@ static OSStatus RequestRateChange(Float64 rate) {
 }
 
 /// Presentation latency may only change through a configuration change (the host stops and restarts IO).
+/// Who applies the master volume: the IO thread picks the change up and ramps to it.
+static OSStatus SetMasterMode(CFPropertyListRef v) {
+    SInt64 mode = 0;
+    if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID() || !CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &mode) ||
+        (mode != kPAVMasterInDriver && mode != kPAVMasterOnDevice))
+        return kAudioHardwareIllegalOperationError;
+    atomic_store(&gMasterOnDevice, mode == kPAVMasterOnDevice);
+    return 0;
+}
+
 static OSStatus RequestLatencyChange(CFPropertyListRef v) {
     SInt64 frames = 0;
     if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID() || !CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &frames))
@@ -521,7 +533,7 @@ static Boolean PAV_HasProperty_Impl(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioDevicePropertyIsHidden: case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyStreams: case kAudioObjectPropertyCustomPropertyInfoList:
         case kPAVPropClients: case kPAVPropVolumes: case kPAVPropAudio: case kPAVPropSurface: case kPAVPropLatency:
-        case kPAVPropRoutes:
+        case kPAVPropRoutes: case kPAVPropMaster:
         case kAudioDevicePropertyClockIsStable: case kAudioDevicePropertyClockAlgorithm:
             return true;
         // Answered on every scope (like Apple's NullAudio sample); coreaudiod drops the device if these fail.
@@ -570,7 +582,8 @@ static OSStatus PAV_IsPropertySettable_Impl(AudioServerPlugInDriverRef inDriver,
     switch (obj) {
     case kObjectID_Device:
         *out = (a->mSelector == kAudioDevicePropertyNominalSampleRate || a->mSelector == kPAVPropVolumes ||
-                a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency || a->mSelector == kPAVPropRoutes);
+                a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency || a->mSelector == kPAVPropRoutes ||
+                a->mSelector == kPAVPropMaster);
         break;
     case kObjectID_Stream:
         *out = (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat ||
@@ -632,7 +645,7 @@ static OSStatus PAV_GetPropertyDataSize_Impl(AudioServerPlugInDriverRef inDriver
             *out = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + kChannels * sizeof(AudioChannelDescription)); return 0;
         case kAudioObjectPropertyCustomPropertyInfoList: *out = kNumCustomProps * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         case kPAVPropClients: case kPAVPropVolumes: case kPAVPropAudio: case kPAVPropSurface: case kPAVPropLatency:
-        case kPAVPropRoutes:
+        case kPAVPropRoutes: case kPAVPropMaster:
             *out = sizeof(CFPropertyListRef); return 0;
         }
         break;
@@ -1128,6 +1141,7 @@ static OSStatus PAV_GetPropertyData_Impl(AudioServerPlugInDriverRef inDriver, Au
                 { kPAVPropSurface, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 { kPAVPropLatency, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 { kPAVPropRoutes,  kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                { kPAVPropMaster,  kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
             };
             UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo); if (n > kNumCustomProps) n = kNumCustomProps;
             memcpy(out, info, n * sizeof(AudioServerPlugInCustomPropertyInfo));
@@ -1151,6 +1165,13 @@ static OSStatus PAV_GetPropertyData_Impl(AudioServerPlugInDriverRef inDriver, Au
             return 0;
         }
         case kPAVPropRoutes: NEED(sizeof(CFPropertyListRef)); *(CFPropertyListRef*)out = CopyRoutes(); *outSize = sizeof(CFPropertyListRef); return 0;
+        case kPAVPropMaster: {
+            NEED(sizeof(CFPropertyListRef));
+            SInt64 m = atomic_load(&gMasterOnDevice) ? kPAVMasterOnDevice : kPAVMasterInDriver;
+            *(CFPropertyListRef*)out = CFNumberCreate(NULL, kCFNumberSInt64Type, &m);
+            *outSize = sizeof(CFPropertyListRef);
+            return 0;
+        }
         case kPAVPropLatency: {
             NEED(sizeof(CFPropertyListRef));
             pthread_mutex_lock(&gStateMutex); SInt64 l = gLatencyFrames; pthread_mutex_unlock(&gStateMutex);
@@ -1279,13 +1300,14 @@ static OSStatus PAV_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioOb
             return RequestRateChange(*(const Float64*)in);
         }
         if (a->mSelector == kPAVPropVolumes || a->mSelector == kPAVPropSurface || a->mSelector == kPAVPropLatency ||
-            a->mSelector == kPAVPropRoutes) {
+            a->mSelector == kPAVPropRoutes || a->mSelector == kPAVPropMaster) {
             if (inSize < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
             if (!CallerMayControl(pid)) return kAudioHardwareIllegalOperationError;
             CFPropertyListRef v = *(const CFPropertyListRef*)in;
             if (a->mSelector == kPAVPropVolumes) { SetVolumeTable(v); return 0; }
             if (a->mSelector == kPAVPropSurface) return AttachSharedRing(v);
             if (a->mSelector == kPAVPropRoutes) return SetRoutes(v);
+            if (a->mSelector == kPAVPropMaster) return SetMasterMode(v);
             return RequestLatencyChange(v);
         }
         break;
@@ -1447,7 +1469,9 @@ static OSStatus PAV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
             RouteClient(c, buf, frames, (uint64_t)ci->mOutputTime.mSampleTime);
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
-        float target = atomic_load_explicit(&gMuted, memory_order_relaxed) ? 0.0f : atomic_load_explicit(&gMasterGain, memory_order_relaxed);
+        float target = atomic_load_explicit(&gMuted, memory_order_relaxed) ? 0.0f
+                     : atomic_load_explicit(&gMasterOnDevice, memory_order_relaxed) ? 1.0f
+                     : atomic_load_explicit(&gMasterGain, memory_order_relaxed);
         ApplyRampedGain(buf, frames, gMasterApplied, target);
         gMasterApplied = target;
 

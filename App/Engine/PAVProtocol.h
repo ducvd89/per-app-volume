@@ -19,9 +19,18 @@
 #define kPAVPropSurface  0x61707366u   // 'apsf'  get/set  shared ring
 #define kPAVPropLatency  0x61706C74u   // 'aplt'  get/set  frames of latency the device reports
 #define kPAVPropRoutes   0x61707274u   // 'aprt'  get/set  per-app outputs (added in 1.4)
+#define kPAVPropMaster   0x61706D73u   // 'apms'  get/set  who applies the master volume (added in 1.6)
 
 // Keys of the 'apvl' dictionary are either "<pid>" or this prefix followed by a bundle ID.
 #define kPAVBundleGainPrefix "b:"
+
+// Who applies the master volume (the virtual device's volume control) to the main mix. 'apms' is a number:
+//   0  the driver (the default): the app plays the mix on an output device running at full volume
+//   1  the output device: the app keeps that device's own volume equal to the master volume, and the
+//      driver leaves the mix at full level. For headphones that set their own level (AirPods).
+// Mute is applied by the driver either way. Not remembered across a restart of the driver.
+#define kPAVMasterInDriver 0
+#define kPAVMasterOnDevice 1
 
 // Per-app outputs. Apps normally end up in the main mix, which the app plays on the main output device.
 // An app can be sent to a "bus" instead (1...kPAVMaxBuses): the driver mixes the apps of a bus into a

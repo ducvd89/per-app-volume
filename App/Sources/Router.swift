@@ -196,6 +196,7 @@ final class Router: ObservableObject {
         earWatch = nil
         dropOwnershipListeners()
         arrivalCheck?.cancel(); arrivalCheck = nil; arrival = nil
+        levelPoll?.cancel(); levelPoll = nil
         mic.stop()
         watchedVirtual = nil
         lastLatency = nil
@@ -422,6 +423,8 @@ final class Router: ObservableObject {
             watchedVirtual = virt.id
             lastLatency = nil
             watchVirtualRunning(virt.id); watchVirtualVolume(virt.id); watchVirtualRate(virt.id); refreshCachedMaster()
+            // A new driver instance applies the master volume itself, and one a crashed app left may not.
+            setMasterOnDevice(ownLevel && !volumeHandedBack)
         }
         if qReleased {
             let def = CA.defaultOutput
@@ -902,7 +905,10 @@ final class Router: ObservableObject {
 
     private func watchVirtualVolume(_ virt: AudioObjectID) {
         for sel in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
-            addListener(virt, sel, scope: kAudioObjectPropertyScopeOutput) { [weak self] in self?.refreshCachedMaster() }
+            addListener(virt, sel, scope: kAudioObjectPropertyScopeOutput) { [weak self] in
+                self?.refreshCachedMaster()
+                self?.syncLevel()
+            }
         }
     }
 
@@ -960,6 +966,8 @@ final class Router: ObservableObject {
     // The real device runs at full volume while we forward to it; its previous level becomes the
     // virtual master volume (what the keyboard keys control), so loudness doesn't jump and 100% in
     // Per-App Volume means the device's real maximum. On quit / switch, the level is handed back.
+    // Headphones that set their own level keep it instead, and the master volume is that level: see
+    // "Headphones that set their own level" below and in DeviceSwitching.
 
     /// False while a real device runs at full volume because we took its level over. Starts true: nothing
     /// has been taken yet, so there is nothing to give back.
@@ -987,8 +995,26 @@ final class Router: ObservableObject {
     private func takeOverVolume(from device: AudioDevice) {
         guard let virt = qVirtual, let hw = CA.hardwareVolume(device.id) else {
             volLog.log("takeOver \(device.name, privacy: .public): no hardware volume")
+            leaveOwnLevel()
             return
         }
+        if keepsOwnLevel(device, virt: virt), setMasterOnDevice(true) {
+            var seen = UserDefaults.standard.stringArray(forKey: "ownLevelDevices") ?? []
+            let level = DeviceSwitching.ownLevel(device: hw, master: cachedMaster.volume, seenBefore: seen.contains(device.uid))
+            volLog.log("takeOver \(device.name, privacy: .public) hw=\(hw): it keeps its own level, master -> \(level)")
+            if !seen.contains(device.uid) { seen.append(device.uid); UserDefaults.standard.set(seen, forKey: "ownLevelDevices") }
+            if level != hw { CA.setHardwareVolume(device.id, level) }
+            CA.set(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, Float32(level))
+            if CA.hardwareMute(device.id) == true {
+                CA.set(virt, kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, UInt32(1))
+                CA.setHardwareMute(device.id, false)
+            }
+            ownLevel = true
+            synced = (masterScalar(virt) ?? level, CA.hardwareVolume(device.id) ?? level)
+            refreshCachedMaster()
+            return
+        }
+        leaveOwnLevel()
         volLog.log("takeOver \(device.name, privacy: .public) hw=\(hw)")
         if hw < 0.999 {
             CA.set(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, Float32(hw))
@@ -1013,6 +1039,11 @@ final class Router: ObservableObject {
     /// from another device.
     private func expectArrivalLevel() {
         dispatchPrecondition(condition: .onQueue(audioQueue))
+        if ownLevel {   // whatever level it arrives with is the master volume anyway
+            arrivalCheck?.cancel(); arrivalCheck = nil; arrival = nil
+            watchOwnLevel()
+            return
+        }
         checkArrivalLevel()   // a window that is still open: don't lose what it would have seen
         arrivalCheck?.cancel(); arrivalCheck = nil
         guard !volumeHandedBack, let t = qTarget, let hw = CA.hardwareVolume(t.id) else { arrival = nil; return }
@@ -1044,9 +1075,85 @@ final class Router: ObservableObject {
         }
     }
 
+    // MARK: Headphones that set their own level (see DeviceSwitching)
+
+    /// The main output keeps its own level and the master volume is that level; the driver leaves the
+    /// mix at full level. Only while that output's volume is taken over (`!volumeHandedBack`).
+    private var ownLevel = false
+    /// The master volume and the output's level when they were last made the same.
+    private var synced: (master: Float, device: Float)?
+    private var levelPoll: DispatchWorkItem?
+
+    /// Apple's headphones (the ones their devices share, see `CA.ownsAudio`), with a driver that can
+    /// leave the master volume to the device (1.6). With an older driver they are taken over like any device.
+    private func keepsOwnLevel(_ device: AudioDevice, virt: AudioObjectID) -> Bool {
+        CA.ownsAudio(device.id) != nil && CA.has(virt, kPropMaster)
+    }
+
+    private func masterScalar(_ virt: AudioObjectID) -> Float? {
+        CA.get(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, default: Float32(1))
+    }
+
+    /// Tells the driver who applies the master volume. False if it couldn't be left to the device.
+    @discardableResult
+    private func setMasterOnDevice(_ on: Bool) -> Bool {
+        guard let virt = qVirtual, CA.has(virt, kPropMaster) else { return !on }
+        return CA.setPlist(virt, kPropMaster, NSNumber(value: on ? kPAVMasterOnDevice : kPAVMasterInDriver)) == noErr
+    }
+
+    private func leaveOwnLevel() {
+        levelPoll?.cancel(); levelPoll = nil
+        ownLevel = false; synced = nil
+        setMasterOnDevice(false)
+    }
+
+    /// Makes the master volume and the output's own level the same again, whichever of them changed.
+    private func syncLevel() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        guard ownLevel, !volumeHandedBack, let virt = qVirtual, let t = qTarget,
+              let hw = CA.hardwareVolume(t.id), let master = masterScalar(virt) else { return }
+        switch DeviceSwitching.levelSync(master: master, device: hw, last: synced) {
+        case .none:
+            if synced == nil { synced = (master, hw) }
+        case .toDevice(let v):
+            CA.setHardwareVolume(t.id, v)
+            synced = (master, CA.hardwareVolume(t.id) ?? v)
+        case .toMaster(let v):
+            volLog.log("\(t.name, privacy: .public) set its level to \(v)")
+            CA.set(virt, kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, Float32(v))
+            synced = (masterScalar(virt) ?? v, hw)
+            refreshCachedMaster()
+        }
+    }
+
+    /// Follows the level the output sets while it plays. The Bluetooth HAL doesn't notify listeners of a
+    /// level the headphones ask for, so look. Call when its volume was taken over and when it starts playing.
+    private func watchOwnLevel() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        levelPoll?.cancel(); levelPoll = nil
+        guard ownLevel, !volumeHandedBack else { return }
+        syncLevel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.levelPoll = nil
+            if PAVEngineIsRunning() { self.watchOwnLevel() } else { self.syncLevel() }
+        }
+        levelPoll = w
+        audioQueue.asyncAfter(deadline: .now() + 0.25, execute: w)
+    }
+
     /// Gives the device its level back. False if the device can't be reached right now (try again later).
     @discardableResult
     private func handBackVolume(to device: AudioDevice) -> Bool {
+        if ownLevel {
+            // It kept its level: only a change of the master volume that hasn't reached it yet is owed.
+            refreshCachedMaster()
+            syncLevel()
+            volLog.log("handBack \(device.name, privacy: .public): it kept its own level")
+            leaveOwnLevel()
+            if cachedMaster.muted, let id = CA.device(uid: device.uid) { CA.setHardwareMute(id, true) }
+            return true
+        }
         guard let id = CA.device(uid: device.uid) else { return false }
         guard CA.hardwareVolume(id) != nil else { return true }   // no volume control: nothing was taken
         refreshCachedMaster()

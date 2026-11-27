@@ -47,6 +47,17 @@ do {
     check(DeviceSwitching.arrivalLevel(before: 0.8, now: 0.8) == nil, "a level it already had before playing stays")
     check(DeviceSwitching.arrivalLevel(before: 0.8, now: 0.5) == 0.5, "a new level replaces one left from before")
     check(DeviceSwitching.arrivalLevel(before: 0.8, now: 1) == nil, "back at full volume: nothing to take over")
+    // Headphones that set their own level (AirPods with Personalized Volume asking for 58%).
+    check(DeviceSwitching.levelSync(master: 0.56, device: 0.69, last: nil) == .toMaster(0.69), "first look: the headphones' level is the master volume")
+    check(DeviceSwitching.levelSync(master: 0.69, device: 0.69, last: nil) == DeviceSwitching.LevelSync.none, "first look, already the same")
+    check(DeviceSwitching.levelSync(master: 0.69, device: 0.58, last: (0.69, 0.69)) == .toMaster(0.58), "the headphones ask for a level: the master volume shows it")
+    check(DeviceSwitching.levelSync(master: 0.75, device: 0.69, last: (0.69, 0.69)) == .toDevice(0.75), "the volume keys change the headphones' level")
+    check(DeviceSwitching.levelSync(master: 0.75, device: 0.58, last: (0.69, 0.69)) == .toDevice(0.75), "both at once: the volume keys win")
+    check(DeviceSwitching.levelSync(master: 0.69, device: 0.692, last: (0.69, 0.69)) == DeviceSwitching.LevelSync.none, "the headphones rounding a level isn't a change")
+    check(DeviceSwitching.levelSync(master: 0.69, device: 0.69, last: (0.69, 0.69)) == DeviceSwitching.LevelSync.none, "nothing changed")
+    check(DeviceSwitching.ownLevel(device: 1, master: 0.56, seenBefore: false) == 0.56, "full volume left by an older version: start at the master volume")
+    check(DeviceSwitching.ownLevel(device: 1, master: 0.56, seenBefore: true) == 1, "full volume they were turned up to stays")
+    check(DeviceSwitching.ownLevel(device: 0.58, master: 0.9, seenBefore: false) == 0.58, "a level of their own counts from the first time")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeBluetooth), "Bluetooth takes over")
     check(DeviceSwitching.canTakeOverOnConnect(transport: kAudioDeviceTransportTypeUSB), "USB takes over")
     for t in [kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAirPlay] {
@@ -201,6 +212,7 @@ print("constants shared with the driver")
 do {
     check(kPropClients == 0x6170_636C && kPropVolumes == 0x6170_766C && kPropLatency == 0x6170_6C74, "property selectors")
     check(kVirtualDeviceUID == "PerAppVolume_UID", "device UID")
+    check(kPropMaster == 0x6170_6D73 && kPAVMasterInDriver == 0 && kPAVMasterOnDevice == 1, "master volume property")
     check(kPropRoutes == 0x6170_7274 && kPAVMaxBuses == 10 && kPAVRoutesKeyRoutes == "routes" && kPAVRoutesKeySurfaces == "surfaces",
           "per-app outputs")
     check(PAVNearestSampleRate(24000) == 24000 && PAVNearestSampleRate(16000) == 16000, "headset rates are matched exactly")
